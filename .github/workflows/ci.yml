@@ -54,12 +54,16 @@ jobs:
       - name: Build serial DHSVM (pnnl/DHSVM-PNNL e6f333d)
         run: |
           gcc --version | head -n1
-          echo "WADER_DHSVM=$(scripts/build_dhsvm.sh | tail -n1)" >> "$GITHUB_ENV"
+          dhsvm="$(scripts/build_dhsvm.sh | tail -n1)"
+          test -x "$dhsvm"
+          echo "WADER_DHSVM=$dhsvm" >> "$GITHUB_ENV"
 
       - name: Cache Chiwawa case
         uses: actions/cache@v5
         with:
-          path: ~/.cache/wader/cases
+          path: |
+            ~/.cache/wader/cases
+            !~/.cache/wader/cases/*/run
           key: chiwawa-${{ env.DHSVM_COMMIT }}-${{ hashFiles('cases/chiwawa/fetch.py', 'src/wader/models/dhsvm/met.py') }}
       - name: Fetch Chiwawa (only the forcing DHSVM uses) and check the selection with DHSVM
         run: python cases/chiwawa/fetch.py --verify-selection "$WADER_DHSVM"
