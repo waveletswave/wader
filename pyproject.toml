@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "wader"
+version = "0.1.0.dev0"
+description = "Setup checks for distributed hydrologic models: wade in before you trust it."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [{ name = "Yiyun Song" }]
+keywords = ["hydrology", "DHSVM", "model setup", "validation", "stream network"]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3",
+  "Topic :: Scientific/Engineering :: Hydrology",
+]
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+wader = "wader.cli:main"
+
+[project.urls]
+Repository = "https://github.com/waveletswave/wader"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/wader"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+  "case_data: needs a fetched reference case (e.g. cases/chiwawa/fetch.py)",
+  "dhsvm: needs a DHSVM executable (WADER_DHSVM or scripts/build_dhsvm.sh)",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]

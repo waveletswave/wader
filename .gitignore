@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Reference data and model runs are never committed (see CLAUDE.md, data policy).
+# Default cache: ${WADER_CACHE:-~/.cache/wader}
+cases/**/data/
+cases/**/TestCase/
+cases/**/run/
+*.bin
+LivnehForcing/
+output/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
