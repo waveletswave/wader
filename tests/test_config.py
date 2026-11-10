@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from wader.models.dhsvm.config import (
     DhsvmConfig,
     c_float,
     c_int,
     make_key_string,
+    scan_date,
     strip_line,
 )
 
@@ -77,3 +80,16 @@ def test_with_value_keeps_everything_else():
     assert c.text.splitlines()[1] == (
         "Model End            = 11/01/1970-00     # Model end time")
     assert c.text.splitlines()[0] == "[TIME]"
+
+
+def test_scan_date_follows_sscandate():
+    # Calendar.c:100-167: numbers split at every non-digit, read as month day year [h [m [s]]]
+    assert scan_date("10/01/1970-00") == datetime(1970, 10, 1, 0)
+    assert scan_date("2/29/1972-21") == datetime(1972, 2, 29, 21)
+    assert scan_date("10.01.1970 03:30:15") == datetime(1970, 10, 1, 3, 30, 15)
+    assert scan_date("10/01/1970") == datetime(1970, 10, 1)
+    assert scan_date("2/29/1971-00") is None  # not a leap year
+    assert scan_date("13/01/1970-00") is None
+    assert scan_date("10/01/1970-24") is None  # hours are 0..23
+    assert scan_date("1970-10") is None  # fewer than three numbers
+    assert scan_date("1970-10-01") is None  # read as month 1970

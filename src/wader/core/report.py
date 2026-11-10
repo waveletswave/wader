@@ -109,6 +109,7 @@ def _result_dict(r: RuleResult) -> dict[str, Any]:
         "findings": [
             {
                 "severity": f.severity.label,
+                "level": f.level or info.level,
                 "message": f.message,
                 "where": f.where,
                 "values": f.values,

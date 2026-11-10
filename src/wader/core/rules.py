@@ -59,6 +59,10 @@ class Evidence:
 
 @dataclass(frozen=True)
 class RuleInfo:
+    """``level`` is one level, or several joined by ``/`` (e.g. ``L0/L1``) when a rule
+    covers errors the model reports itself and errors it accepts silently. Findings of
+    such a rule say which level they belong to (``Finding.level``)."""
+
     id: str
     title: str
     level: str
@@ -69,8 +73,12 @@ class RuleInfo:
     params: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if self.level not in LEVELS:
+        if not all(part in LEVELS for part in self.level.split("/")):
             raise ValueError(f"{self.id}: unknown level {self.level!r}")
+
+    @property
+    def levels(self) -> tuple[str, ...]:
+        return tuple(self.level.split("/"))
 
 
 @dataclass
@@ -80,6 +88,7 @@ class Finding:
     message: str
     where: dict[str, Any] = field(default_factory=dict)
     values: dict[str, Any] = field(default_factory=dict)
+    level: str = ""  # one of the rule's levels; empty means the rule's own level
 
 
 @dataclass
@@ -165,6 +174,10 @@ def run_rule(rule: RegisteredRule, case: Any,
         return RuleResult(rule.info, Outcome.SKIP, str(exc), params=params)
     except InputProblem as exc:
         return RuleResult(rule.info, Outcome.ERROR, str(exc), params=params)
+    for f in out.findings:
+        if f.level and f.level not in rule.info.levels:
+            raise ValueError(f"{rule.info.id}: finding level {f.level!r} is not one of "
+                             f"the rule's levels ({rule.info.level})")
     failed = any(f.severity >= Severity.WARNING for f in out.findings)
     outcome = Outcome.FAIL if failed else Outcome.PASS
     return RuleResult(rule.info, outcome, out.summary, out.findings, out.metrics, params)

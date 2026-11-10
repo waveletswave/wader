@@ -19,9 +19,15 @@ the shipped tableio.c when flex is absent):
   ``1.5e-3`` is read as REAL ``1.5`` followed by INTEGER ``3``.
 
 Fields are matched to the field definitions as in ``table_get_fields`` /
-``handle_field`` (tableio.lex:200-310): token *i* is tried against definition
-*i*; an INTEGER is accepted for a REAL field; an optional field whose type does
-not match is skipped and the next definition is tried.
+``handle_field`` (tableio.lex:201-286, 297-365): token *i* is tried against
+definition *i*; an INTEGER is accepted for a REAL field; an optional field whose
+type does not match is skipped and the next definition is tried. Every mismatch
+or missing required field counts as a table error; a file with table errors is
+rejected as a whole (e.g. channel.c:472-483), and DHSVM stops.
+
+The readers keep IDs as written. DHSVM stores segment and class IDs in an
+``unsigned short`` (channel.h:16), so an ID above ``ID_MAX`` wraps; the rules
+report such IDs instead of emulating the wrap.
 """
 
 from __future__ import annotations
@@ -35,6 +41,9 @@ import numpy as np
 # Number types from VarID.c (verified-source)
 DEM_DTYPE = np.dtype("<f4")  # VarID.c:51-53, NC_FLOAT
 MASK_DTYPE = np.dtype("u1")  # VarID.c:54-55, NC_BYTE
+SOIL_DEPTH_DTYPE = np.dtype("<f4")  # VarID.c:58-60, NC_FLOAT
+
+ID_MAX = 65535  # SegmentID and ClassID are unsigned short (channel.h:16)
 
 
 class MapReadError(Exception):
@@ -89,8 +98,18 @@ class Token:
 
 @dataclass(frozen=True)
 class TableNote:
+    """Something DHSVM's table reader does with a line: ``error`` notes are table
+    errors (DHSVM rejects the file), ``ignored`` notes are fields it drops with only
+    a message, ``echo`` notes are characters it skips."""
+
     lineno: int
     message: str
+    kind: str = "error"
+
+
+def as_c_float(value: float) -> float:
+    """A table REAL as DHSVM holds it: a C ``float`` (tableio.h:32-35)."""
+    return float(np.float32(value))
 
 
 def scan_line(line: str) -> tuple[list[Token], str, str]:
@@ -148,10 +167,18 @@ class FieldDef:
     words: tuple[str, ...] = ()
 
 
-def match_fields(tokens: list[Token], defs: tuple[FieldDef, ...]) -> tuple[dict, list[str]]:
-    """Assign tokens to field definitions like ``table_get_fields``/``handle_field``."""
+def match_fields(tokens: list[Token],
+                 defs: tuple[FieldDef, ...]) -> tuple[dict, list[str], list[str]]:
+    """Assign tokens to field definitions like ``table_get_fields``/``handle_field``.
+
+    Returns the field values, the table errors DHSVM counts (any of them makes it
+    reject the file), and the fields it only prints 'unable to match field' for:
+    that branch does not count an error (tableio.lex:270-283), so the field is
+    dropped and the record is kept.
+    """
     values: dict[str, tuple[int | float | str, Token]] = {}
     errors: list[str] = []
+    ignored: list[str] = []
 
     def handle(tok: Token, offset: int) -> None:
         d = defs[offset]
@@ -167,7 +194,7 @@ def match_fields(tokens: list[Token], defs: tuple[FieldDef, ...]) -> tuple[dict,
         elif offset + 1 < len(defs):
             handle(tok, offset + 1)
         else:
-            errors.append(f"unable to match field {tok.value!r}")
+            ignored.append(f"{tok.kind} {tok.value!r} matches no remaining field")
 
     for i, tok in enumerate(tokens):
         if i >= len(defs):
@@ -177,7 +204,41 @@ def match_fields(tokens: list[Token], defs: tuple[FieldDef, ...]) -> tuple[dict,
     for d in defs:
         if d.required and d.name not in values:
             errors.append(f"{d.name} required but not read")
-    return values, errors
+    return values, errors, ignored
+
+
+def scan_table(path: Path, defs: tuple[FieldDef, ...],
+               what: str) -> tuple[list[str], list[tuple[int, dict]], list[TableNote]]:
+    """Read a table file: its lines, the (line number, field values) of every
+    record, and the notes on what DHSVM's reader does with it."""
+    if not path.is_file():
+        raise MapReadError(f"{what} file not found: {path}")
+    lines = path.read_bytes().decode("latin-1").split("\n")
+    records: list[tuple[int, dict]] = []
+    notes: list[TableNote] = []
+    for lineno, line in enumerate(lines, start=1):
+        tokens, _, echoed = scan_line(line)
+        if echoed.strip("\r"):
+            notes.append(TableNote(lineno, f"DHSVM skips (and echoes) {echoed!r}", "echo"))
+        if not tokens:
+            continue
+        values, errors, ignored = match_fields(tokens, defs)
+        for e in errors:
+            notes.append(TableNote(lineno, f"DHSVM reports an error: {e}", "error"))
+        for e in ignored:
+            notes.append(TableNote(lineno, "DHSVM prints 'unable to match field' and drops "
+                                           f"the field: {e}", "ignored"))
+        records.append((lineno, values))
+    return lines, records, notes
+
+
+def replace_token(line: str, index: int, text: str) -> str:
+    """``line`` with its ``index``-th table token replaced by ``text`` (right-aligned
+    in the old token's width when shorter)."""
+    tok = scan_line(line)[0][index]
+    if len(text) < tok.end - tok.start:
+        text = text.rjust(tok.end - tok.start)
+    return line[:tok.start] + text + line[tok.end:]
 
 
 # ------------------------------------------------------------- stream network
@@ -236,19 +297,10 @@ class StreamNetwork:
 
 def read_stream_network(path: str | Path) -> StreamNetwork:
     path = Path(path)
-    if not path.is_file():
-        raise MapReadError(f"stream network file not found: {path}")
-    lines = path.read_bytes().decode("latin-1").split("\n")
-    net = StreamNetwork(path, lines)
-    for lineno, line in enumerate(lines, start=1):
-        tokens, _, echoed = scan_line(line)
-        if echoed.strip("\r"):
-            net.notes.append(TableNote(lineno, f"DHSVM skips (and echoes) {echoed!r}"))
-        if not tokens:
-            continue
-        values, errors = match_fields(tokens, NETWORK_FIELDS)
-        for e in errors:
-            net.notes.append(TableNote(lineno, f"DHSVM reports an error: {e}"))
+    lines, records, notes = scan_table(path, NETWORK_FIELDS, "stream network")
+    net = StreamNetwork(path, lines, notes=notes)
+    for lineno, values in records:
+        line = lines[lineno - 1]
         if any(k not in values for k in ("id", "order", "slope", "length", "class")):
             continue
         out_val, out_tok = values.get("outlet", (0, None))
@@ -342,6 +394,7 @@ class StreamMap:
     cut_width: np.ndarray
     lineno: np.ndarray
     notes: list[TableNote] = field(default_factory=list)
+    lines: list[str] = field(default_factory=list)
 
     def __len__(self) -> int:
         return len(self.segment)
@@ -364,19 +417,9 @@ class StreamMap:
 
 def read_stream_map(path: str | Path) -> StreamMap:
     path = Path(path)
-    if not path.is_file():
-        raise MapReadError(f"stream map file not found: {path}")
+    lines, records, notes = scan_table(path, MAP_FIELDS, "stream map")
     rows: list[tuple] = []
-    notes: list[TableNote] = []
-    for lineno, line in enumerate(path.read_bytes().decode("latin-1").split("\n"), start=1):
-        tokens, _, echoed = scan_line(line)
-        if echoed.strip("\r"):
-            notes.append(TableNote(lineno, f"DHSVM skips (and echoes) {echoed!r}"))
-        if not tokens:
-            continue
-        values, errors = match_fields(tokens, MAP_FIELDS)
-        for e in errors:
-            notes.append(TableNote(lineno, f"DHSVM reports an error: {e}"))
+    for lineno, values in records:
         if any(k not in values for k in ("col", "row", "segment", "length", "cut_height",
                                          "cut_width")):
             continue
@@ -396,4 +439,57 @@ def read_stream_map(path: str | Path) -> StreamMap:
         cut_width=arr[:, 5],
         lineno=arr[:, 6].astype(int),
         notes=notes,
+        lines=lines,
     )
+
+
+# -------------------------------------------------------------- stream classes
+CLASS_FIELDS = (  # channel.c:97-107; the last two are required for road classes only
+    FieldDef("id", "int", True),
+    FieldDef("width", "real", True),
+    FieldDef("bank_height", "real", True),
+    FieldDef("friction", "real", True),
+    FieldDef("infiltration", "real", False),
+    FieldDef("crown", "word", False, ("OUTSLOPED", "CROWNED", "INSLOPED")),
+)
+
+
+@dataclass
+class ChannelClass:
+    id: int
+    width: float  # read and required to be > 0, but not used by DHSVM (channel.c:161-166)
+    bank_height: float  # 0.75 x bank height is the flow depth in the routing constant
+    friction: float  # Manning's n (channel.c:311-314)
+    lineno: int
+
+
+@dataclass
+class StreamClasses:
+    path: Path
+    lines: list[str]
+    classes: list[ChannelClass] = field(default_factory=list)
+    notes: list[TableNote] = field(default_factory=list)
+
+    def by_id(self) -> dict[int, ChannelClass]:
+        """First class per ID, like ``find_channel_class`` (channel.c:71-79)."""
+        out: dict[int, ChannelClass] = {}
+        for c in self.classes:
+            out.setdefault(c.id, c)
+        return out
+
+
+def read_stream_classes(path: str | Path) -> StreamClasses:
+    path = Path(path)
+    lines, records, notes = scan_table(path, CLASS_FIELDS, "stream class")
+    out = StreamClasses(path, lines, notes=notes)
+    for lineno, values in records:
+        if any(k not in values for k in ("id", "width", "bank_height", "friction")):
+            continue
+        out.classes.append(ChannelClass(
+            id=int(values["id"][0]),
+            width=float(values["width"][0]),
+            bank_height=float(values["bank_height"][0]),
+            friction=float(values["friction"][0]),
+            lineno=lineno,
+        ))
+    return out
