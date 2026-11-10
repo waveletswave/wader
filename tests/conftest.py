@@ -32,10 +32,14 @@ ORDER = {1: 1, 2: 1, 3: 2, 4: 1, 5: 3, 6: 1}
 LENGTH = {1: 120.0, 2: 170.0, 3: 150.0, 4: 170.0, 5: 210.0, 6: 72.4}
 
 INPUT_TEMPLATE = """\
-# Synthetic DHSVM setup for wader tests (only the sections wader reads)
+# Synthetic DHSVM setup for wader tests (only the entries wader reads)
 [OPTIONS]                     # Model options
 Format               = BIN    # BIN, BYTESWAP or NETCDF
+Extent               = BASIN
+Flow Routing         = NETWORK
 Gridded Met data     = FALSE
+Shading              = FALSE
+Canopy Gapping       = FALSE
 [AREA]
 Extreme North        = 5000480.0
 Extreme West         = 500000.0
@@ -48,6 +52,8 @@ Model Start          = 10/01/1970-00
 Model End            = 10/02/1970-00
 [CONSTANTS]
 Outside Basin Value  = 0
+Rain Threshold       = -0.5
+Snow Threshold       = 0.5
 [TERRAIN]
 DEM File             = input/dem.bin
 Basin Mask File      = input/mask.bin
@@ -55,10 +61,18 @@ Basin Mask File      = input/mask.bin
 Stream Map File      = input/stream.map.dat
 Stream Network File  = input/stream.network.dat
 Stream Class File    = input/stream.class.dat
+[SOILS]
+Soil Map File        = input/soil.bin
+Soil Depth File      = input/soild.bin
+Number of Soil Types = 1
+Number of Soil Layers 1 = 3
+[VEGETATION]
+Vegetation Map File  = input/veg.bin
 [OUTPUT]
 Output Directory     = output/
 [End]
 """
+SOIL_DEPTH = 1.5  # m, everywhere (also outside the basin mask)
 
 
 def synthetic_dem() -> np.ndarray:
@@ -98,6 +112,9 @@ def make_synthetic_case(root: Path, down: dict | None = None, order: dict | None
     inp.mkdir(parents=True, exist_ok=True)
     synthetic_dem().tofile(inp / "dem.bin")
     synthetic_mask().tofile(inp / "mask.bin")
+    np.ones((NROWS, NCOLS), dtype="u1").tofile(inp / "soil.bin")
+    np.full((NROWS, NCOLS), SOIL_DEPTH, dtype="<f4").tofile(inp / "soild.bin")
+    np.ones((NROWS, NCOLS), dtype="u1").tofile(inp / "veg.bin")
     (inp / "stream.network.dat").write_text(network_text(down or DOWN, order or ORDER,
                                                          outlet_text))
     (inp / "stream.map.dat").write_text(map_text())

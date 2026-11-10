@@ -18,7 +18,8 @@ relies on, with a source location in
 that behaviour was verified in the source, verified by running DHSVM, reported
 by others, or not yet verified.
 
-Status: pre-alpha (milestone M0). The rule set is small; see below.
+Status: pre-alpha (milestone M1 in progress). Nine rules so far, for the stream network
+files and the binary maps; see below.
 
 ## Install
 
@@ -35,7 +36,7 @@ wader check dhsvm path/to/INPUT --workdir path/to/run/dir
 wader check dhsvm path/to/INPUT --json          # machine-readable report
 
 wader rules                                     # rules, parameters, evidence
-wader mutations                                 # error-injection operators
+wader mutations                                 # error-injection operators, and what DHSVM does with each
 wader mutate dhsvm path/to/INPUT reverse-network -o mutated/
 ```
 
@@ -44,16 +45,34 @@ Exit codes: 0 no error findings, 1 error findings (`--strict`: warnings too),
 
 ## Rules
 
-| ID | What it checks | Level | Caught mutation |
+| ID | What it checks | Level | Caught mutations |
 |---|---|---|---|
+| DHSVM-MAP-001 | Every binary map DHSVM reads exists and holds exactly rows x columns x data sets values of its number type. A short file stops DHSVM; a long one is read without a message, as different numbers | L0/L1 | `truncate-map`, `float64-dem` |
+| DHSVM-NET-001 | DHSVM accepts every stream network record: readable fields; ID and order of at least 1; slope and length above 0; IDs unique and at most 65535 | L0/L1 | `zero-slope` |
+| DHSVM-NET-003 | Every positive outlet ID names a segment; the links form no cycle; some segment leaves the network | L0/L1 | `dangling-outlet`, `cycle` |
 | DHSVM-NET-004 | No link runs uphill: a segment's outlet segment is not higher (lowest DEM cell, tolerance 1 m) | L1 | `reverse-network` |
 | DHSVM-NET-005 | Linked segments touch in `stream.map.dat` (gap <= 1.5 cells) | L1 | `jump` |
 | DHSVM-NET-006 | A single outlet lies within 3 cells of the basin's lowest cell; no outlet receives more than 4 segments directly | L1 | `reverse-network`, `force-wire` |
+| DHSVM-NET-007 | DHSVM accepts every stream map record (inside the grid, known segment, no negative value, no negative soil depth in its cell) and uses it (inside the basin mask); no in-basin cell has a channel length of 0; every segment has a record | L0/L1 | `map-swap-row-col`, `zero-length-record` |
+| DHSVM-NET-010 | Every class a segment uses is defined, with width, bank height and Manning's n above 0; bank height and Manning's n of the classes in use are plausible | L0/L1/L2 | `missing-class`, `placeholder-classes` |
 | DHSVM-NET-013 | The outlet ID is written so DHSVM reads it as an outlet (DHSVM reads `-1` as segment `1`) | L1 | `negative-outlet` |
 
 Levels: L0 = DHSVM stops with an error; L1 = DHSVM accepts the input but results
 are wrong, the input is silently changed, or the run crashes; L2 = physical
-plausibility. Run `wader rules` for the evidence behind each rule.
+plausibility. A rule that spans levels marks each finding with its own level
+(`level` in the JSON report). Run `wader rules` for the evidence behind each rule.
+
+What wader adds lies mostly in L1. Each line below was reproduced by running
+DHSVM `e6f333d` on the Chiwawa case with one thing changed
+(`tests/test_dhsvm_runs.py`):
+
+| Input | DHSVM | wader |
+|---|---|---|
+| A segment drains into its own tributary (a cycle) | exit 0, same warnings and mass balance error; the outlet loses over 99% of its flow | NET-003 |
+| One stream map record has length 0 | exit 0; the outlet hydrograph is NaN | NET-007 |
+| The DEM is written as 8-byte floats | no read error; stops at the first time step with an unrelated error 47 | MAP-001 |
+| Class bank heights are PNNL's template placeholders (0.03-0.10 m) | exit 0; the hydrograph changes. Class widths, in contrast, are never used | NET-010 |
+| An outlet ID is written as 65539 | exit 0; read as segment 3 | NET-003 |
 
 ## Reference cases and data
 

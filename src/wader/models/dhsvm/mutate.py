@@ -1,15 +1,19 @@
 """Mutation operators: write a copy of a DHSVM setup with one known error injected.
 
-Each operator names the rules that must catch it. The mutated stream network
-keeps every line of the original except the fields that change (order and
-outlet ID); routing orders are recomputed as 1 + max(order of upstream
+Each operator names the rules that must catch it and says what DHSVM itself
+does with the mutant (``MutationInfo.dhsvm``); ``tests/test_dhsvm_runs.py``
+checks that statement by running DHSVM on the Chiwawa case.
+
+A mutant replaces one or more of the files the INPUT names and keeps every
+other byte: the topology operators rewrite only the order and outlet fields of
+the stream network and recompute routing orders as 1 + max(order of upstream
 segments), so the result still satisfies DHSVM's routing-order requirement
 (channel.c:538-549) and DHSVM reads and runs it.
 """
 
 from __future__ import annotations
 
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,7 +21,13 @@ from pathlib import Path
 import numpy as np
 
 from wader.models.dhsvm.case import DhsvmCase
-from wader.models.dhsvm.io import rewrite_network
+from wader.models.dhsvm.io import replace_token, rewrite_network
+from wader.models.dhsvm.maps import expected_maps
+
+NETWORK = ("ROUTING", "Stream Network File")
+STREAM_MAP = ("ROUTING", "Stream Map File")
+CLASSES = ("ROUTING", "Stream Class File")
+DEM = ("TERRAIN", "DEM File")
 
 
 class MutationError(Exception):
@@ -30,18 +40,21 @@ class MutationInfo:
     title: str
     targets: tuple[str, ...]
     description: str
+    dhsvm: str = "runs to the end without an error"  # what DHSVM does with the mutant
 
 
 @dataclass
-class MutatedNetwork:
+class Mutated:
+    """A mutant: new contents for some of the files the INPUT names."""
+
     info: MutationInfo
-    text: str
-    downstream: dict[int, int | None]
-    order: dict[int, int]
+    files: dict[tuple[str, str], bytes]  # INPUT (section, key) -> new file content
     changes: list[str] = field(default_factory=list)
+    downstream: dict[int, int | None] | None = None  # topology operators only
+    order: dict[int, int] | None = None
 
 
-Operator = Callable[[DhsvmCase, dict], MutatedNetwork]
+Operator = Callable[[DhsvmCase, dict], Mutated]
 MUTATIONS: dict[str, tuple[MutationInfo, Operator]] = {}
 
 
@@ -50,6 +63,10 @@ def _operator(info: MutationInfo) -> Callable[[Operator], Operator]:
         MUTATIONS[info.name] = (info, fn)
         return fn
     return deco
+
+
+def _text(lines: list[str]) -> bytes:
+    return "\n".join(lines).encode("latin-1")
 
 
 # ------------------------------------------------------------------ helpers
@@ -90,17 +107,21 @@ def _tree(case: DhsvmCase) -> tuple[dict[int, int | None], dict[int, list[int]],
     outlets = [s for s, d in down.items() if d is None]
     if not outlets:
         raise MutationError("the network has no outlet")
-
-    def size(root: int) -> int:
-        n, todo = 0, [root]
-        while todo:
-            x = todo.pop()
-            n += 1
-            todo.extend(children[x])
-        return n
-
-    main = max(outlets, key=lambda o: (size(o), -o))
+    main = max(outlets, key=lambda o: (_size(children, o), -o))
     return down, children, main
+
+
+def _size(children: dict[int, list[int]], root: int) -> int:
+    """Number of segments in the tree that drains through ``root`` (itself included)."""
+    n, todo, seen = 0, [root], {root}
+    while todo:
+        x = todo.pop()
+        n += 1
+        for c in children[x]:
+            if c not in seen:
+                seen.add(c)
+                todo.append(c)
+    return n
 
 
 def _path_lengths(case: DhsvmCase, children: dict[int, list[int]], root: int) -> dict[int, float]:
@@ -111,19 +132,28 @@ def _path_lengths(case: DhsvmCase, children: dict[int, list[int]], root: int) ->
     while todo:
         x = todo.popleft()
         for c in children[x]:
-            dist[c] = dist[x] + by_id[c].length
-            todo.append(c)
+            if c not in dist:
+                dist[c] = dist[x] + by_id[c].length
+                todo.append(c)
     return dist
 
 
 def _finish(case: DhsvmCase, info: MutationInfo, down: dict[int, int | None],
-            changes: list[str]) -> MutatedNetwork:
+            changes: list[str]) -> Mutated:
     order = routing_orders(down)
     text = rewrite_network(case.network, down, order)
-    return MutatedNetwork(info, text, down, order, changes)
+    return Mutated(info, {NETWORK: text.encode("latin-1")}, changes, down, order)
 
 
-# ---------------------------------------------------------------- operators
+def _keep_orders(case: DhsvmCase, info: MutationInfo, down: dict[int, int | None],
+                 changes: list[str], outlet_sentinel: str | None = None) -> Mutated:
+    """Rewrite outlet fields only; routing orders stay as they are."""
+    order = {s.id: s.order for s in case.network.segments}
+    text = rewrite_network(case.network, down, order, outlet_sentinel=outlet_sentinel)
+    return Mutated(info, {NETWORK: text.encode("latin-1")}, changes, down, order)
+
+
+# ------------------------------------------------- topology (network links)
 @_operator(MutationInfo(
     name="reverse-network",
     title="Reverse the flow direction of the main stem",
@@ -135,7 +165,7 @@ def _finish(case: DhsvmCase, info: MutationInfo, down: dict[int, int | None],
         "recomputed. Slopes, lengths, classes and the stream map are unchanged."
     ),
 ))
-def reverse_network(case: DhsvmCase, params: dict) -> MutatedNetwork:
+def reverse_network(case: DhsvmCase, params: dict) -> Mutated:
     down, children, main = _tree(case)
     dist = _path_lengths(case, children, main)
     leaves = [n for n in dist if not children[n] and n != main]
@@ -194,7 +224,7 @@ def _leaf_gaps(case: DhsvmCase, children: dict[int, list[int]],
         "The outlet is the lowest segment, so no link rises; the links jump across the basin."
     ),
 ))
-def jump(case: DhsvmCase, params: dict) -> MutatedNetwork:
+def jump(case: DhsvmCase, params: dict) -> Mutated:
     count = int(params.get("count", 1))
     down, children, main = _tree(case)
     picks = [(g, n) for g, n in _leaf_gaps(case, children, main) if g > 1.5][:count]
@@ -218,7 +248,7 @@ def jump(case: DhsvmCase, params: dict) -> MutatedNetwork:
         "could not connect to one sink."
     ),
 ))
-def force_wire(case: DhsvmCase, params: dict) -> MutatedNetwork:
+def force_wire(case: DhsvmCase, params: dict) -> Mutated:
     count = int(params.get("count", 8))
     down, children, main = _tree(case)
     picks = [n for _, n in _leaf_gaps(case, children, main)][:count]
@@ -239,24 +269,263 @@ def force_wire(case: DhsvmCase, params: dict) -> MutatedNetwork:
         "Write the outlet ID of every outlet segment as -1, the convention of some network "
         "generators. DHSVM reads it as 1."
     ),
+    dhsvm="runs to the end; the network 'Totals' outflow is 0",
 ))
-def negative_outlet(case: DhsvmCase, params: dict) -> MutatedNetwork:
+def negative_outlet(case: DhsvmCase, params: dict) -> Mutated:
     down, _, _ = _tree(case)
     outlets = [s for s, d in down.items() if d is None]
     changes = [f"segment {s}: outlet written as -1" for s in outlets]
-    keep_order = {s.id: s.order for s in case.network.segments}
-    text = rewrite_network(case.network, down, keep_order, outlet_sentinel="-1")
-    return MutatedNetwork(MUTATIONS["negative-outlet"][0], text, down, keep_order, changes)
+    return _keep_orders(case, MUTATIONS["negative-outlet"][0], down, changes,
+                        outlet_sentinel="-1")
+
+
+@_operator(MutationInfo(
+    name="dangling-outlet",
+    title="Point a segment at an outlet segment that does not exist",
+    targets=("DHSVM-NET-003",),
+    description=(
+        "Rewrite the outlet ID of one headwater segment (the first in the file, or "
+        "`segment`) to an ID that no segment has."
+    ),
+    dhsvm="stops while reading the network: 'cannot find outlet', exit 5",
+))
+def dangling_outlet(case: DhsvmCase, params: dict) -> Mutated:
+    down, children, main = _tree(case)
+    ids = set(down)
+    if "segment" in params:
+        seg = int(params["segment"])
+        if seg not in ids:
+            raise MutationError(f"no segment {seg}")
+    else:
+        heads = [s.id for s in case.network.segments if not children[s.id] and s.id != main]
+        if not heads:
+            raise MutationError("the outlet has no upstream segments")
+        seg = heads[0]
+    missing = max(ids) + 1
+    if missing > 65535:  # stay below the unsigned short limit (channel.h:16)
+        missing = next(i for i in range(1, 65536) if i not in ids)
+    new_down = dict(down)
+    new_down[seg] = missing
+    changes = [f"segment {seg}: drains to {down[seg] or 'outside'} -> {missing}, "
+               "which names no segment"]
+    return _keep_orders(case, MUTATIONS["dangling-outlet"][0], new_down, changes)
+
+
+@_operator(MutationInfo(
+    name="cycle",
+    title="Make a segment drain into one of its own upstream segments",
+    targets=("DHSVM-NET-003",),
+    description=(
+        "Take the segment with the largest upstream tree that is not an outlet and rewrite "
+        "its outlet ID to its own largest tributary. The two then form a cycle, and "
+        "everything upstream of them never reaches the outlet. Routing orders are kept."
+    ),
+    dhsvm="runs to the end without an error; the water that enters the cycle is lost",
+))
+def cycle(case: DhsvmCase, params: dict) -> Mutated:
+    down, children, main = _tree(case)
+    candidates = [s for s in down if down[s] is not None and children[s]]
+    if not candidates:
+        raise MutationError("no segment with both an upstream and a downstream segment")
+    seg = max(candidates, key=lambda s: (_size(children, s), -s))
+    tributary = max(children[seg], key=lambda c: (_size(children, c), -c))
+    new_down = dict(down)
+    new_down[seg] = tributary
+    changes = [f"segment {seg}: drains to {down[seg]} -> {tributary}, its own tributary "
+               f"({_size(children, seg)} of {len(down)} segments now drain into the cycle)"]
+    return _keep_orders(case, MUTATIONS["cycle"][0], new_down, changes)
+
+
+# ------------------------------------------------- stream network records
+@_operator(MutationInfo(
+    name="zero-slope",
+    title="Set the slope of one segment to 0",
+    targets=("DHSVM-NET-001",),
+    description=(
+        "Rewrite the slope of one segment (the first in the file, or `segment`) as 0.00000, "
+        "as a generator does that takes the slope from a flat DEM without a lower bound."
+    ),
+    dhsvm="stops while reading the network: 'channel slope (0.000000) invalid', exit 5",
+))
+def zero_slope(case: DhsvmCase, params: dict) -> Mutated:
+    net = case.network
+    if not net.segments:
+        raise MutationError("the network has no segments")
+    seg = net.by_id().get(int(params["segment"])) if "segment" in params else net.segments[0]
+    if seg is None:
+        raise MutationError(f"no segment {params['segment']}")
+    lines = list(net.lines)
+    lines[seg.lineno - 1] = replace_token(lines[seg.lineno - 1], 2, "0.00000")
+    return Mutated(MUTATIONS["zero-slope"][0], {NETWORK: _text(lines)},
+                   [f"segment {seg.id}: slope {seg.slope:g} -> 0"])
+
+
+@_operator(MutationInfo(
+    name="missing-class",
+    title="Give one segment a channel class that is not in the class file",
+    targets=("DHSVM-NET-010",),
+    description=(
+        "Rewrite the class of one segment (the first in the file, or `segment`) to an ID "
+        "the class file does not define."
+    ),
+    dhsvm="stops while reading the network: 'channel class N not found', exit 5",
+))
+def missing_class(case: DhsvmCase, params: dict) -> Mutated:
+    net = case.network
+    if not net.segments:
+        raise MutationError("the network has no segments")
+    seg = net.by_id().get(int(params["segment"])) if "segment" in params else net.segments[0]
+    if seg is None:
+        raise MutationError(f"no segment {params['segment']}")
+    known = {c.id for c in case.classes.classes}
+    new = max(known | {s.cls for s in net.segments}) + 1
+    lines = list(net.lines)
+    lines[seg.lineno - 1] = replace_token(lines[seg.lineno - 1], 4, str(new))
+    return Mutated(MUTATIONS["missing-class"][0], {NETWORK: _text(lines)},
+                   [f"segment {seg.id}: class {seg.cls} -> {new}, which the class file "
+                    "does not define"])
+
+
+# PNNL's unedited class template: widths by contributing area, depths by slope
+# (DHSVM-PNNL@e6f333d CreateStreamNetwork_PythonV/channelclass.py:35-124).
+_TEMPLATE_WIDTHS = (0.5, 1.0, 2.0, 3.0, 4.0, 4.5)
+_TEMPLATE_DEPTHS = (0.03, 0.05, 0.1)
+
+
+@_operator(MutationInfo(
+    name="placeholder-classes",
+    title="Replace class widths and depths by PNNL's template placeholders",
+    targets=("DHSVM-NET-010",),
+    description=(
+        "Rewrite the width and bank height of every channel class with the values of PNNL's "
+        "class template (widths 0.5-4.5 m, depths 0.03-0.10 m), which the template says "
+        "must be edited by hand. Manning's n is kept."
+    ),
+    dhsvm="runs to the end without an error; the hydrograph changes (shallow depths slow "
+          "the routing)",
+))
+def placeholder_classes(case: DhsvmCase, params: dict) -> Mutated:
+    table = case.classes
+    if not table.classes:
+        raise MutationError("the class file defines no classes")
+    lines = list(table.lines)
+    changes = []
+    for k, c in enumerate(table.classes):
+        width = _TEMPLATE_WIDTHS[k % 6]
+        depth = _TEMPLATE_DEPTHS[(k // 6) % 3]
+        line = replace_token(lines[c.lineno - 1], 2, f"{depth:g}")
+        lines[c.lineno - 1] = replace_token(line, 1, f"{width:.1f}")
+        changes.append(f"class {c.id}: width {c.width:g} -> {width:g} m, bank height "
+                       f"{c.bank_height:g} -> {depth:g} m")
+    return Mutated(MUTATIONS["placeholder-classes"][0], {CLASSES: _text(lines)}, changes)
+
+
+# ------------------------------------------------------------- stream map
+@_operator(MutationInfo(
+    name="map-swap-row-col",
+    title="Swap the column and row fields of the stream map",
+    targets=("DHSVM-NET-007",),
+    description=(
+        "Write every stream-map record as 'row column ...' instead of 'column row ...'. On "
+        "a grid that is not square some records then fall outside the grid."
+    ),
+    dhsvm="stops while reading the stream map: 'bad coordinates', exit 5",
+))
+def map_swap_row_col(case: DhsvmCase, params: dict) -> Mutated:
+    sm, g = case.stream_map, case.grid
+    outside = int(((sm.row >= g.ncols) | (sm.col >= g.nrows)).sum())
+    if not outside:
+        raise MutationError("after the swap every record is still inside the grid, so "
+                            "DHSVM would not reject the map")
+    lines = list(sm.lines)
+    for lineno, col, row in zip(sm.lineno, sm.col, sm.row, strict=True):
+        line = replace_token(lines[lineno - 1], 1, str(col))
+        lines[lineno - 1] = replace_token(line, 0, str(row))
+    return Mutated(MUTATIONS["map-swap-row-col"][0], {STREAM_MAP: _text(lines)},
+                   [f"{len(sm)} records: column and row swapped; {outside} now lie outside "
+                    f"the {g.nrows} x {g.ncols} grid"])
+
+
+@_operator(MutationInfo(
+    name="zero-length-record",
+    title="Set the channel length of one stream-map record to 0",
+    targets=("DHSVM-NET-007",),
+    description=(
+        "Rewrite the length of the first stream-map record that is alone in an in-basin "
+        "cell as 0.00000, as can happen when a segment only touches the corner of a cell."
+    ),
+    dhsvm="runs to the end with exit status 0; streamflow downstream of the cell is NaN",
+))
+def zero_length_record(case: DhsvmCase, params: dict) -> Mutated:
+    sm, g = case.stream_map, case.grid
+    in_grid = (sm.row >= 0) & (sm.row < g.nrows) & (sm.col >= 0) & (sm.col < g.ncols)
+    per_cell = Counter(zip(sm.row[in_grid].tolist(), sm.col[in_grid].tolist(), strict=True))
+    for k in np.flatnonzero(in_grid):
+        r, c = int(sm.row[k]), int(sm.col[k])
+        if per_cell[(r, c)] == 1 and case.mask[r, c] and sm.length[k] > 0:
+            break
+    else:
+        raise MutationError("no in-basin cell holds exactly one stream-map record")
+    lines = list(sm.lines)
+    lineno = int(sm.lineno[k])
+    lines[lineno - 1] = replace_token(lines[lineno - 1], 3, "0.00000")
+    return Mutated(MUTATIONS["zero-length-record"][0], {STREAM_MAP: _text(lines)},
+                   [f"line {lineno}: segment {int(sm.segment[k])} in cell row {r}, column {c}: "
+                    f"length {sm.length[k]:g} -> 0"])
+
+
+# ------------------------------------------------------------ binary maps
+@_operator(MutationInfo(
+    name="truncate-map",
+    title="Cut a binary map file short",
+    targets=("DHSVM-MAP-001",),
+    description=(
+        "Keep only the first half of one binary map (the DEM, or the map whose label is "
+        "given as `map`, e.g. 'soil depth'), as after an interrupted copy."
+    ),
+    dhsvm="stops when it reads the map: 'Error while reading file', exit 2",
+))
+def truncate_map(case: DhsvmCase, params: dict) -> Mutated:
+    label = str(params.get("map", "DEM"))
+    # only maps that an INPUT entry names directly (not the monthly shading files)
+    specs = {s.label: s for s in expected_maps(case) if s.path == case.path(*s.entry)}
+    if label not in specs:
+        raise MutationError(f"no map {label!r}; choose from {', '.join(specs)}")
+    spec = specs[label]
+    data = spec.path.read_bytes()
+    return Mutated(MUTATIONS["truncate-map"][0], {spec.entry: data[: len(data) // 2]},
+                   [f"{label} ({spec.path.name}): {len(data)} -> {len(data) // 2} bytes"])
+
+
+@_operator(MutationInfo(
+    name="float64-dem",
+    title="Write the DEM as 8-byte floats",
+    targets=("DHSVM-MAP-001",),
+    description=(
+        "Write the DEM with 8-byte instead of 4-byte floats (numpy's default number type), "
+        "which doubles the file. DHSVM reads the first half as 4-byte floats."
+    ),
+    dhsvm="reports no read error and computes with meaningless elevations; on Chiwawa it "
+          "stops at the first time step with error 47 (table index out of bounds)",
+))
+def float64_dem(case: DhsvmCase, params: dict) -> Mutated:
+    path = case.path(*DEM)
+    dem = np.fromfile(path, dtype="<f4")
+    data = dem.astype("<f8").tobytes()
+    return Mutated(MUTATIONS["float64-dem"][0], {DEM: data},
+                   [f"DEM ({path.name}): 4-byte -> 8-byte floats, {dem.nbytes} -> "
+                    f"{len(data)} bytes"])
 
 
 # ------------------------------------------------------------------ writing
 def mutate_case(case: DhsvmCase, name: str, out_dir: str | Path,
-                params: dict | None = None) -> tuple[Path, MutatedNetwork]:
-    """Write ``out_dir/<network file>`` and ``out_dir/INPUT.<name>``.
+                params: dict | None = None) -> tuple[Path, Mutated]:
+    """Write the mutant's files and ``out_dir/INPUT.<name>``.
 
-    The new INPUT differs from the original only in ``[ROUTING] Stream Network
-    File``, which points to the mutated file by absolute path, so the mutated
-    setup runs from the same working directory as the original.
+    Each replaced file keeps its name and goes to ``out_dir``. The new INPUT
+    differs from the original only in the entries that name those files, which
+    point to the new files by absolute path, so the mutated setup runs from the
+    same working directory as the original.
     """
     if name not in MUTATIONS:
         raise MutationError(f"unknown mutation {name!r}; choose from {', '.join(MUTATIONS)}")
@@ -264,9 +533,11 @@ def mutate_case(case: DhsvmCase, name: str, out_dir: str | Path,
     mutated = fn(case, params or {})
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    net_path = (out_dir / case.network.path.name).resolve()
-    net_path.write_bytes(mutated.text.encode("latin-1"))
-    config = case.config.with_value("ROUTING", "Stream Network File", str(net_path))
+    config = case.config
+    for (section, key), content in mutated.files.items():
+        new_path = (out_dir / case.path(section, key).name).resolve()
+        new_path.write_bytes(content)
+        config = config.with_value(section, key, str(new_path))
     input_path = out_dir / f"INPUT.{name}"
     config.write(input_path)
     return input_path, mutated

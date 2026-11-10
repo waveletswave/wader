@@ -56,7 +56,20 @@ independent of every generator, so that its verdicts can be trusted.
     silently changed, or the run crashes.
   - L2: physical plausibility.
 
-  Severities are error, warning and info.
+  Severities are error, warning and info. A rule may span levels (`L0/L1`);
+  then every finding states its own level (`Finding.level`).
+- **One rule owns one defect.** NET-001, NET-007 and NET-010 each cover one
+  channel file (network, map, classes) and report everything that makes DHSVM
+  reject that file, table errors included; NET-003 covers the links. Do not
+  report the same defect from two rules; raise `NotApplicable` and name the
+  rule that owns it.
+- **Say what DHSVM does, and show it.** A finding says what DHSVM does with
+  the input ("DHSVM rejects the network (exit 5)", "DHSVM never uses this
+  record"). Every mutation states what DHSVM does with the mutant
+  (`MutationInfo.dhsvm`), and `tests/test_dhsvm_runs.py` must run DHSVM on it;
+  `test_every_mutation_has_a_dhsvm_experiment` fails otherwise. Reading the
+  source is not enough: an experiment corrected the first reading of what
+  DHSVM does with map records outside the basin mask.
 - **Tests that need data:** mark them `case_data` (a fetched reference case)
   or `dhsvm` (a DHSVM executable). They skip when the data are missing, unless
   `WADER_REQUIRE_CASES=1` is set. CI sets it, so these tests can never be
@@ -79,11 +92,12 @@ scripts/demo_reverse_network.sh          # the reversed-network demo
 
 ```
 src/wader/core/              rules, findings, registry, reports (model-independent)
-src/wader/models/dhsvm/      config.py  INPUT parser (DHSVM semantics)
-                             io.py      binary maps, stream network/map tables
-                             case.py    a setup as DHSVM sees it (paths, grid, maps)
+src/wader/models/dhsvm/      config.py  INPUT parser (DHSVM semantics), dates
+                             io.py      binary maps, stream network/map/class tables
+                             case.py    a setup as DHSVM sees it (paths, grid, maps, period)
+                             maps.py    which binary maps DHSVM reads, and how many bytes
                              met.py     gridded-met file selection (InitGridMet port)
-                             rules/     net.py (NET-*); more groups to come
+                             rules/     net.py (NET-*), map.py (MAP-*); more groups to come
                              mutate.py  error-injection operators
 src/wader/cli.py             wader check | rules | mutate | mutations
 cases/chiwawa/               fetch.py (sparse checkout), run.py (DHSVM run)

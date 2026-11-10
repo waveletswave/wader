@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 BUFSIZE = 255
@@ -121,6 +122,35 @@ def c_float(text: str) -> float | None:
     if not _FLOAT_RE.fullmatch(text):
         return None
     return float(text)
+
+
+def _atoi(text: str) -> int:
+    m = re.match(r"[ \t\n\v\f\r]*([+-]?[0-9]+)", text)
+    return int(m.group(1)) if m else 0
+
+
+def scan_date(text: str) -> datetime | None:
+    """Python port of ``SScanDate`` (Calendar.c:100-167), or None if DHSVM rejects it.
+
+    Every non-digit character after the first one separates two numbers; they are
+    read as month, day, year and then, if present, hour, minute and second. The
+    usual form is ``MM/DD/YYYY-HH``.
+    """
+    numbers: list[int] = []  # filled from the end of the string, as in the C code
+    end = len(text)
+    for i in range(len(text) - 1, 0, -1):
+        if not ("0" <= text[i] <= "9"):
+            numbers.append(_atoi(text[i + 1 : end]))
+            end = i
+    numbers.append(_atoi(text[:end]))
+    if not 3 <= len(numbers) <= 6:  # Calendar.c:126
+        return None
+    month, day, year, *rest = reversed(numbers)
+    hour, minute, second = (rest + [0, 0, 0])[:3]
+    try:  # the range checks of Calendar.c:150-159
+        return datetime(year, month, day, hour, minute, second)
+    except ValueError:
+        return None
 
 
 class DhsvmConfig:

@@ -8,9 +8,13 @@ import pytest
 from wader.models.dhsvm.io import (
     NETWORK_FIELDS,
     MapReadError,
+    as_c_float,
     match_fields,
     read_bin_map,
+    read_stream_classes,
+    read_stream_map,
     read_stream_network,
+    replace_token,
     rewrite_network,
     scan_line,
 )
@@ -38,16 +42,31 @@ def test_exponents_as_dhsvm_reads_them():
 
 def test_comments_and_optional_fields():
     tokens, _, _ = scan_line('7 1 0.1 100 3 SAVE "x y"  # comment 99')
-    values, errors = match_fields(tokens, NETWORK_FIELDS)
-    assert not errors
+    values, errors, ignored = match_fields(tokens, NETWORK_FIELDS)
+    assert not errors and not ignored
     assert "outlet" not in values  # optional field skipped: outlet ID defaults to 0
     assert values["save"][0] == "SAVE" and values["save_name"][0] == "x y"
     assert values["length"][0] == 100.0  # INTEGER accepted for a REAL field
 
 
 def test_missing_required_field_is_an_error():
-    _, errors = match_fields(scan_line("7 1 0.1")[0], NETWORK_FIELDS)
+    _, errors, _ = match_fields(scan_line("7 1 0.1")[0], NETWORK_FIELDS)
     assert any("required" in e for e in errors)
+
+
+def test_field_that_matches_no_optional_field_is_dropped_not_an_error():
+    # tableio.lex:270-283: 'unable to match field' is printed without counting an error
+    values, errors, ignored = match_fields(scan_line("7 1 0.1 100 3 5 42")[0], NETWORK_FIELDS)
+    assert not errors and ignored == ["int 42 matches no remaining field"]
+    assert values["outlet"][0] == 5
+    # an unquoted name after SAVE is a WORD, not the STRING the name field expects
+    values, errors, ignored = match_fields(scan_line("7 1 0.1 100 3 5 SAVE Out")[0],
+                                           NETWORK_FIELDS)
+    assert not errors and "save" in values and "save_name" not in values
+    assert ignored == ["word 'Out' matches no remaining field"]
+    # but a ninth field is one too many, and that is an error
+    _, errors, _ = match_fields(scan_line('7 1 0.1 100 3 5 SAVE "Out" 9')[0], NETWORK_FIELDS)
+    assert errors == ["too many fields, expected 8"]
 
 
 def test_network_outlet_written_as_minus_one(tmp_path):
@@ -87,3 +106,45 @@ def test_binary_map_size(tmp_path):
     assert read_bin_map(p, 2, 4, np.dtype("<f4")).extra_bytes == 16  # DHSVM ignores extras
     with pytest.raises(MapReadError, match="FileIOBin.c"):
         read_bin_map(p, 4, 4, np.dtype("<f4"))
+
+
+def test_table_notes_tell_errors_from_skipped_characters(tmp_path):
+    p = tmp_path / "net.dat"
+    p.write_text("1 1 0.1 100 3 -1\n2 1 0.1\n")
+    net = read_stream_network(p)
+    assert [(n.lineno, n.kind) for n in net.notes] == [(1, "echo"), (2, "error"), (2, "error")]
+    assert [s.id for s in net.segments] == [1]  # the incomplete record is not a segment
+
+
+def test_class_file_as_dhsvm_reads_it(tmp_path):
+    p = tmp_path / "class.dat"
+    # '15.' is INTEGER 15 followed by a '.' that the scanner skips (as in PNNL's Chiwawa file);
+    # the fifth and sixth fields are optional for stream classes (channel.c:97-107)
+    p.write_text("#ID W D n inf\n1 2.0 0.400 0.0503 0.0\n10 15. 0.806 0.0506\n"
+                 "1 9 9 9\n7 1.0\n")
+    table = read_stream_classes(p)
+    assert [(c.id, c.width, c.bank_height, c.friction, c.lineno) for c in table.classes] == [
+        (1, 2.0, 0.4, 0.0503, 2), (10, 15.0, 0.806, 0.0506, 3), (1, 9.0, 9.0, 9.0, 4)]
+    assert table.by_id()[1].bank_height == 0.4  # first match wins (channel.c:71-79)
+    assert [(n.lineno, n.kind) for n in table.notes] == [(3, "echo"), (5, "error"), (5, "error")]
+    with pytest.raises(MapReadError, match="stream class file not found"):
+        read_stream_classes(tmp_path / "nope.dat")
+
+
+def test_stream_map_keeps_its_lines(tmp_path):
+    p = tmp_path / "map.dat"
+    p.write_text("# col row id len cut_h cut_w\n  6   0   1   30.000  0.500  2.000    180.0\n")
+    sm = read_stream_map(p)
+    assert sm.lines[1].split()[:3] == ["6", "0", "1"] and list(sm.lineno) == [2]
+
+
+def test_replace_token_keeps_the_columns():
+    line = "    1   1     0.37931         381.83766  13       3"
+    assert replace_token(line, 2, "0.00000") == line.replace("0.37931", "0.00000")
+    assert replace_token(line, 4, "7") == "    1   1     0.37931         381.83766   7       3"
+    assert replace_token(line, 5, "65539") == line[:-1] + "65539"
+
+
+def test_table_reals_are_c_floats():
+    assert as_c_float(1e-50) == 0.0  # underflows in a C float, so DHSVM sees a slope of 0
+    assert as_c_float(0.37931) == pytest.approx(0.37931, rel=1e-7)
