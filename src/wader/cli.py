@@ -83,6 +83,7 @@ def _cmd_mutate(args: argparse.Namespace) -> int:
         return EXIT_NOT_EVALUATED
     print(f"{mutated.info.name}: {mutated.info.title}")
     print(f"  should be caught by: {', '.join(mutated.info.targets)}")
+    print(f"  DHSVM: {mutated.info.dhsvm}")
     for line in mutated.changes[:12]:
         print(f"  {line}")
     if len(mutated.changes) > 12:
@@ -95,6 +96,7 @@ def _cmd_mutations(args: argparse.Namespace) -> int:
     for name, (info, _) in sorted(MUTATIONS.items()):
         print(f"{name}: {info.title}")
         print(f"    caught by: {', '.join(info.targets)}")
+        print(f"    DHSVM: {info.dhsvm}")
         print(f"    {info.description}\n")
     return 0
 
