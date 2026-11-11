@@ -28,7 +28,10 @@ def test_original_network_passes_topology_rules(chiwawa_input, chiwawa_workdir):
     [outlet] = res["DHSVM-NET-006"].metrics["outlets"]
     assert outlet["segment"] == 494 and outlet["distance_cells"] == 0.0
     assert outlet["direct_inflows"] == 2
-    assert report.exit_code() == 0  # the NET-013 finding below is a warning
+    # As distributed, the case fails two rules: its outlet is written as -1 (a warning)
+    # and its output directory does not exist (an error). Both are tested below.
+    failing = {r.rule.id for r in report.results if r.outcome != Outcome.PASS}
+    assert failing == {"DHSVM-NET-013", "DHSVM-RUN-002"} and report.exit_code() == 1
 
 
 def test_original_case_passes_the_file_rules(chiwawa_input, chiwawa_workdir):
@@ -69,22 +72,64 @@ def test_original_outlet_written_as_minus_one_is_reported(chiwawa_input, chiwawa
 
 
 def test_outlet_written_as_zero_passes_net013(chiwawa_input, chiwawa_workdir, tmp_path):
+    """With the outlet written as 0 and an output directory that exists, the case passes
+    every rule."""
     case = DhsvmCase(chiwawa_input, chiwawa_workdir)
     net = case.network
     fixed = tmp_path / "stream.network.dat"
     fixed.write_text(rewrite_network(net, net.intended_downstream(),
                                      {s.id: s.order for s in net.segments},
                                      outlet_sentinel="0"))
+    (tmp_path / "output").mkdir()
     cfg = case.config.with_value("ROUTING", "Stream Network File", str(fixed))
+    cfg = cfg.with_value("OUTPUT", "Output Directory", f"{tmp_path}/output/")
     cfg.write(tmp_path / "INPUT.outlet0")
     report = dhsvm.check(tmp_path / "INPUT.outlet0", chiwawa_workdir)
     assert {r.outcome for r in report.results} == {Outcome.PASS}, report.to_text()
 
 
-@pytest.mark.parametrize("name", [n for n in sorted(MUTATIONS) if n != "negative-outlet"])
-def test_mutations_are_caught(chiwawa_input, chiwawa_workdir, tmp_path, name):
+def test_original_case_passes_the_soil_depth_and_state_rules(chiwawa_input, chiwawa_workdir):
+    res = by_id(dhsvm.check(chiwawa_input, chiwawa_workdir))
+    soil = res["DHSVM-MAP-003"]
+    assert soil.outcome == Outcome.PASS and not soil.findings, soil.summary
+    # one vegetation class, root zones of 0.06 + 0.13 + 0.21 m; the shallowest soil is 0.97 m
+    [cls] = soil.metrics["classes"]
+    assert cls["total_root_depth_m"] == pytest.approx(0.40, abs=1e-6)
+    assert soil.metrics["min_margin_m"] == pytest.approx(0.57, abs=1e-3)
+    assert soil.metrics["tested_cells"] == soil.metrics["basin_cells"]
+    state = res["DHSVM-STA-001"]
+    assert state.outcome == Outcome.PASS, state.summary
+    # 2 canopy layers and 3 soil layers: 5, 8 and 10 data sets of 425 x 300 floats
+    assert [(f["data_sets"], f["bytes"]) for f in state.metrics["files"]] == [
+        (n, 425 * 300 * 4 * n) for n in (5, 8, 10)]
+
+
+def test_case_as_distributed_has_no_output_directory(chiwawa, chiwawa_input, chiwawa_workdir):
+    """RUN-002 finds a real problem in the reference case: its INPUT names
+    TestCase/Chiwawa/output/, which the repository does not contain. DHSVM stops on it
+    (tests/test_dhsvm_runs.py::test_chiwawa_as_distributed_has_no_output_directory)."""
+    assert not (chiwawa / "TestCase" / "Chiwawa" / "output").exists()
+    res = by_id(dhsvm.check(chiwawa_input, chiwawa_workdir))["DHSVM-RUN-002"]
+    assert res.outcome == Outcome.FAIL
+    (f,) = res.findings
+    assert f.level == "L0" and "does not exist" in f.message
+    assert "Cannot open file: ../../TestCase/Chiwawa/output/Aggregated.Values" in f.message
+
+
+def test_run_002_passes_once_the_output_directory_exists(chiwawa_input, chiwawa_workdir,
+                                                         tmp_path):
     case = DhsvmCase(chiwawa_input, chiwawa_workdir)
-    mutated, m = mutate_case(case, name, tmp_path / "mut")
+    (tmp_path / "output").mkdir()
+    path = case.config.with_value("OUTPUT", "Output Directory",
+                                  f"{tmp_path}/output/").write(tmp_path / "INPUT")
+    res = by_id(dhsvm.check(path, chiwawa_workdir))["DHSVM-RUN-002"]
+    assert res.outcome == Outcome.PASS and not res.findings
+
+
+@pytest.mark.parametrize("name", [n for n in sorted(MUTATIONS) if n != "negative-outlet"])
+def test_mutations_are_caught(chiwawa_input, chiwawa_workdir, short_tmp, name):
+    case = DhsvmCase(chiwawa_input, chiwawa_workdir)
+    mutated, m = mutate_case(case, name, short_tmp / "mut")
     res = by_id(dhsvm.check(mutated, chiwawa_workdir))
     for rid in m.info.targets:
         assert res[rid].outcome == Outcome.FAIL, (rid, res[rid].summary)

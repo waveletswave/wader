@@ -7,6 +7,8 @@ unless WADER_REQUIRE_CASES=1 (set in CI), in which case they fail.
 from __future__ import annotations
 
 import os
+import shutil
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -68,11 +70,26 @@ Number of Soil Types = 1
 Number of Soil Layers 1 = 3
 [VEGETATION]
 Vegetation Map File  = input/veg.bin
+Number of Vegetation Types = 2
+Vegetation Description 1 = Forest
+Overstory Present 1  = TRUE
+Understory Present 1 = TRUE
+Number of Root Zones 1 = 3
+Root Zone Depths 1   = 0.10 0.25 0.40
+Vegetation Description 2 = Grass   # in the table, not on the map
+Overstory Present 2  = FALSE
+Understory Present 2 = TRUE
+Number of Root Zones 2 = 3
+Root Zone Depths 2   = 0.10 0.20 0.30
 [OUTPUT]
 Output Directory     = output/
+Initial State Directory = state/
 [End]
 """
 SOIL_DEPTH = 1.5  # m, everywhere (also outside the basin mask)
+ROOT_DEPTH = 0.75  # m, total of vegetation class 1, the only class on the map
+STAMP = "10.01.1970.00.00.00"  # Model Start, as in state file names
+STATE_SETS = {"Interception": 5, "Snow": 8, "Soil": 10}  # 2 canopy layers, 3 soil layers
 
 
 def synthetic_dem() -> np.ndarray:
@@ -119,9 +136,25 @@ def make_synthetic_case(root: Path, down: dict | None = None, order: dict | None
                                                          outlet_text))
     (inp / "stream.map.dat").write_text(map_text())
     (inp / "stream.class.dat").write_text("1 2.0 0.5 0.04 0.0\n")
+    (root / "output").mkdir(exist_ok=True)
+    (root / "state").mkdir(exist_ok=True)
+    for kind, sets in STATE_SETS.items():
+        np.zeros((sets, NROWS, NCOLS), dtype="<f4").tofile(
+            root / "state" / f"{kind}.State.{STAMP}.bin")
+    (root / "state" / f"Channel.State.{STAMP}").write_text(
+        "".join(f"{sid:12d} {0.0:12g}\n" for sid in sorted(SEGMENTS)))
     path = root / "INPUT.synthetic"
     path.write_text(INPUT_TEMPLATE)
     return path
+
+
+@pytest.fixture
+def short_tmp():
+    """A temporary directory with a short path. DHSVM has room for 85 characters in front
+    of a state file name (InitModelState.c:57), and pytest's own paths can be longer."""
+    path = Path(tempfile.mkdtemp(prefix="wader-", dir="/tmp" if Path("/tmp").is_dir() else None))
+    yield path
+    shutil.rmtree(path, ignore_errors=True)
 
 
 @pytest.fixture

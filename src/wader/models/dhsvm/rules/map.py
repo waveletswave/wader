@@ -5,6 +5,8 @@ Source references are to pnnl/DHSVM-PNNL@e6f333d (DHSVM/sourcecode/).
 
 from __future__ import annotations
 
+import numpy as np
+
 from wader.core.rules import (
     CheckOutput,
     Evidence,
@@ -77,13 +79,6 @@ MAP_001 = RuleInfo(
 )
 
 
-def _reads(spec: MapSpec, nrows: int, ncols: int) -> str:
-    kind = "float" if spec.dtype.kind == "f" else "integer"
-    sets = f" x {spec.layers} data sets" if spec.layers > 1 else ""
-    return (f"{spec.expected_bytes(nrows, ncols)} bytes ({nrows} rows x {ncols} columns x "
-            f"{spec.dtype.itemsize}-byte {kind}{sets})")
-
-
 def _too_long_hint(spec: MapSpec, size: int, nrows: int, ncols: int) -> str:
     layer = spec.layer_bytes(nrows, ncols)
     if size % layer:
@@ -122,7 +117,7 @@ def check_map_001(case: DhsvmCase, params: dict) -> CheckOutput:
             counts["too_short"] += 1
             findings.append(Finding(
                 MAP_001.id, Severity.ERROR,
-                f"{name}: {size} bytes, but DHSVM reads {_reads(spec, g.nrows, g.ncols)}; it "
+                f"{name}: {size} bytes, but DHSVM reads {spec.reads(g.nrows, g.ncols)}; it "
                 f"stops {spec.when} ('Error while reading file', exit 2)",
                 where=where, values=values, level="L0"))
         elif size > expected:
@@ -130,7 +125,7 @@ def check_map_001(case: DhsvmCase, params: dict) -> CheckOutput:
             findings.append(Finding(
                 MAP_001.id, Severity.ERROR,
                 f"{name}: {size} bytes, but DHSVM reads only the first "
-                f"{_reads(spec, g.nrows, g.ncols)} and ignores the rest without a message; "
+                f"{spec.reads(g.nrows, g.ncols)} and ignores the rest without a message; "
                 f"{_too_long_hint(spec, size, g.nrows, g.ncols)}",
                 where=where, values=values, level="L1"))
     skipped = unchecked_inputs(case)
@@ -144,3 +139,134 @@ def check_map_001(case: DhsvmCase, params: dict) -> CheckOutput:
         f"{counts['too_long']} too long")
     return CheckOutput(summary=summary, findings=findings,
                        metrics={"files": files, **counts})
+
+
+# ------------------------------------------------------------------ MAP-003
+MAP_003 = RuleInfo(
+    id="DHSVM-MAP-003",
+    title="The soil is deeper than the root zones in every basin cell",
+    level="L0",
+    severity=Severity.ERROR,
+    rationale=(
+        "In every cell inside the basin the soil depth must be greater than the total root "
+        "depth of the cell's vegetation class, which is the sum of the class's root zone "
+        "depths. The root zones are the upper soil layers, and the layer below them is as "
+        "thick as what is left of the soil depth, so that must be more than nothing. DHSVM "
+        "tests this before it reads the stream network or the forcing and stops at the "
+        "first cell that fails. A cell whose vegetation class is not in the vegetation "
+        "table cannot be tested: DHSVM stops on it in the same routine, and this rule "
+        "reports it until DHSVM-MAP-002 covers class values."
+    ),
+    evidence=(
+        Evidence(
+            "CheckOut adds up the root zone depths of each vegetation class in single "
+            "precision (VType.TotalDepth), then visits the basin cells row by row and, at the "
+            "first one whose soil depth is not greater than the total root depth of its "
+            "class, prints the class, the cell and both depths and calls exit(-1). It runs "
+            "after the terrain, soil and vegetation maps are read and before the network and "
+            "the forcing. The layer below the root zones gets the soil depth minus the total "
+            "root depth as its thickness.",
+            Status.VERIFIED_SOURCE,
+            SRC + "CheckOut.c:81-84, 136-148; InitTables.c:377-378, 583-585; "
+                  "MainDHSVM.c:157-163; AdjustStorage.c:55-73",
+        ),
+        Evidence(
+            "Before that, the same routine stops on the first basin cell whose vegetation "
+            "class is below 1 or above the number of classes ('veg value N out of range', "
+            "exit(-1)).",
+            Status.VERIFIED_SOURCE,
+            SRC + "CheckOut.c:42-49",
+        ),
+        Evidence(
+            "Chiwawa has one vegetation class with root zones of 0.06, 0.13 and 0.21 m. With "
+            "the soil depth of nine basin cells set to their single-precision sum, DHSVM "
+            "prints 'Soil depth is 0.400000, Root depth is 0.400000' for the first of them "
+            "and exits with status 255. With those cells deeper by the smallest "
+            "single-precision step, it runs to the end.",
+            Status.VERIFIED_EXPERIMENT,
+            "tests/test_dhsvm_runs.py::test_dhsvm_stops_on_mutant[shallow-soil], "
+            "::test_soil_one_step_deeper_than_the_roots_is_accepted (2026-11-11)",
+        ),
+    ),
+    mutations=("shallow-soil",),
+    params={"thin_layer_m": 0.05},
+)
+
+CAP = 20  # cells listed per finding
+
+
+@register(MODEL, MAP_003)
+def check_map_003(case: DhsvmCase, params: dict) -> CheckOutput:
+    thin = float(params["thin_layer_m"])
+    types = case.veg_types
+    veg, depth, basin = case.veg_type, case.soil_depth, case.mask
+    known = basin & (veg >= 1) & (veg <= len(types))
+    # both sides are single-precision values held in doubles, so <= is DHSVM's comparison
+    totals = np.array([0.0] + [t.total_root_depth for t in types])
+    total = totals[np.where(known, veg, 0)]
+    failing = known & (depth <= total)
+
+    findings: list[Finding] = []
+    classes = []
+    for t in types:
+        here = known & (veg == t.index)
+        if not here.any():
+            continue
+        classes.append({"class": t.index, "description": t.description,
+                        "root_zone_depths_m": list(t.root_depths),
+                        "total_root_depth_m": t.total_root_depth, "cells": int(here.sum())})
+        cells = np.argwhere(failing & here)  # in DHSVM's scan order
+        if not len(cells):
+            continue
+        row, col = (int(v) for v in cells[0])
+        shallowest = float(depth[failing & here].min())
+        name = f"vegetation class {t.index}" + (f" ({t.description})" if t.description else "")
+        findings.append(Finding(
+            MAP_003.id, Severity.ERROR,
+            f"{len(cells)} basin cells of {name} have a soil depth that is not greater than "
+            f"the class's total root depth of {t.total_root_depth:.6g} m (shallowest "
+            f"{shallowest:.6g} m; first at row {row}, column {col}); DHSVM stops before it "
+            "reads the network ('Soil depth is ..., Root depth is ...', exit 255)",
+            where={"vegetation_class": t.index, "n_cells": len(cells),
+                   "cells": [[int(r), int(c)] for r, c in cells[:CAP]]},
+            values={"total_root_depth_m": t.total_root_depth, "min_soil_depth_m": shallowest},
+        ))
+
+    unknown = basin & ~known
+    n_unknown = int(unknown.sum())
+    if n_unknown:
+        cells = np.argwhere(unknown)
+        values = sorted({int(v) for v in veg[unknown]})
+        findings.append(Finding(
+            MAP_003.id, Severity.ERROR,
+            f"{n_unknown} basin cells have a vegetation class that is not one of the "
+            f"{len(types)} classes of the vegetation table (values {values[:CAP]}; first at "
+            f"row {int(cells[0][0])}, column {int(cells[0][1])}), so their soil depth was not "
+            "tested; DHSVM stops on the first of them ('veg value N out of range', exit 255)",
+            where={"n_cells": n_unknown, "cells": [[int(r), int(c)] for r, c in cells[:CAP]]},
+            values={"vegetation_classes": values[:CAP]},
+        ))
+
+    n_known, n_failing = int(known.sum()), int(failing.sum())
+    margins = (depth - total)[known]
+    n_thin = int(((margins > 0) & (margins < thin)).sum())
+    metrics = {
+        "basin_cells": int(basin.sum()), "tested_cells": n_known, "failing_cells": n_failing,
+        "untested_cells": n_unknown,
+        "min_margin_m": float(margins.min()) if n_known else None,
+        "cells_with_layer_below_roots_thinner_than_thin_layer_m": n_thin,
+        "classes": classes,
+    }
+    if n_failing or n_unknown:
+        summary = (f"{n_failing} of {n_known} basin cells have soil no deeper than their "
+                   "root zones")
+        if n_unknown:
+            summary += f"; {n_unknown} more could not be tested"
+    else:
+        summary = (f"{n_known} basin cells: the soil is deeper than the root zones "
+                   f"everywhere (by at least {float(margins.min()):.3g} m)" if n_known
+                   else "no basin cells")
+        if n_thin:
+            summary += (f"; in {n_thin} cells the layer below the root zones is thinner than "
+                        f"{thin:g} m")
+    return CheckOutput(summary=summary, findings=findings, metrics=metrics)

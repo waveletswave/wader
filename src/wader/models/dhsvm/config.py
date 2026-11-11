@@ -124,6 +124,22 @@ def c_float(text: str) -> float | None:
     return float(text)
 
 
+def c_floats(text: str, n: int) -> list[float] | None:
+    """Values of ``CopyFloat(Value, text, n)`` (GetInit.c:311-327): ``n`` numbers read
+    one after another with ``strtod``. None if DHSVM rejects the entry, which it does
+    when a number is missing or when anything follows the last one."""
+    if n <= 0:  # nothing is read and nothing is checked
+        return []
+    pos, out = 0, []
+    for _ in range(n):
+        m = _FLOAT_RE.match(text, pos)
+        if not m:
+            return None
+        out.append(float(m.group(0)))
+        pos = m.end()
+    return out if pos == len(text) else None
+
+
 def _atoi(text: str) -> int:
     m = re.match(r"[ \t\n\v\f\r]*([+-]?[0-9]+)", text)
     return int(m.group(1)) if m else 0

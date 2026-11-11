@@ -9,10 +9,16 @@ other byte: the topology operators rewrite only the order and outlet fields of
 the stream network and recompute routing orders as 1 + max(order of upstream
 segments), so the result still satisfies DHSVM's routing-order requirement
 (channel.c:538-549) and DHSVM reads and runs it.
+
+Two kinds of mutant do not replace a file the INPUT names. Some change the
+text of an INPUT entry (the output directory). Others change a state file,
+which DHSVM finds through a directory entry and a name it builds itself; they
+bring their own state directory, with links to the files they leave alone.
 """
 
 from __future__ import annotations
 
+import shutil
 from collections import Counter, defaultdict, deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -22,12 +28,24 @@ import numpy as np
 
 from wader.models.dhsvm.case import DhsvmCase
 from wader.models.dhsvm.io import replace_token, rewrite_network
-from wader.models.dhsvm.maps import expected_maps
+from wader.models.dhsvm.maps import (
+    STATE_DIRECTORY,
+    MapSpec,
+    expected_maps,
+    state_files,
+    state_stamp,
+)
 
 NETWORK = ("ROUTING", "Stream Network File")
 STREAM_MAP = ("ROUTING", "Stream Map File")
 CLASSES = ("ROUTING", "Stream Class File")
 DEM = ("TERRAIN", "DEM File")
+SOIL_DEPTH = ("SOILS", "Soil Depth File")
+OUTPUT_DIRECTORY = ("OUTPUT", "Output Directory")
+
+# DHSVM builds state file names in char[NAMESIZE + 1] (InitModelState.c:57; settings.h:94).
+# The longest, "Interception.State.MM.DD.YYYY.HH.MM.SS.bin", has 42 characters.
+STATE_PREFIX_MAX = 127 - 42
 
 
 class MutationError(Exception):
@@ -45,13 +63,20 @@ class MutationInfo:
 
 @dataclass
 class Mutated:
-    """A mutant: new contents for some of the files the INPUT names."""
+    """A mutant: new contents for some of the files the INPUT names, new text for some
+    INPUT entries, and files of its own."""
 
     info: MutationInfo
     files: dict[tuple[str, str], bytes]  # INPUT (section, key) -> new file content
     changes: list[str] = field(default_factory=list)
     downstream: dict[int, int | None] | None = None  # topology operators only
     order: dict[int, int] | None = None
+    # INPUT (section, key) -> new text; "{out}" stands for the mutant's directory
+    values: dict[tuple[str, str], str] = field(default_factory=dict)
+    # files of the mutant's own, by path below its directory: new content, or an
+    # existing file to link to
+    tree: dict[str, bytes] = field(default_factory=dict)
+    links: dict[str, Path] = field(default_factory=dict)
 
 
 Operator = Callable[[DhsvmCase, dict], Mutated]
@@ -517,15 +542,168 @@ def float64_dem(case: DhsvmCase, params: dict) -> Mutated:
                     f"{len(data)} bytes"])
 
 
+@_operator(MutationInfo(
+    name="shallow-soil",
+    title="Make the soil as shallow as the root zones in a few cells",
+    targets=("DHSVM-MAP-003",),
+    description=(
+        "Set the soil depth of a few basin cells (9, or `cells`) to exactly the total root "
+        "depth of their vegetation class, as a soil depth map made without looking at the "
+        "vegetation table can."
+    ),
+    dhsvm="stops before it reads the network: it prints the first such cell ('Soil depth "
+          "is ..., Root depth is ...') and exits with status 255",
+))
+def shallow_soil(case: DhsvmCase, params: dict) -> Mutated:
+    n = int(params.get("cells", 9))
+    g = case.grid
+    path = case.path(*SOIL_DEPTH)
+    depth = np.fromfile(path, dtype="<f4")
+    if depth.size != g.nrows * g.ncols:
+        raise MutationError(f"{path} does not hold {g.nrows} x {g.ncols} 4-byte floats")
+    depth = depth.reshape(g.nrows, g.ncols)
+    types, veg = case.veg_types, case.veg_type
+    cells = np.argwhere(case.mask & (veg >= 1) & (veg <= len(types)))
+    if n < 1 or len(cells) < n:
+        raise MutationError(f"the basin has {len(cells)} cells with a vegetation class of "
+                            f"the table; cannot change {n}")
+    first = (len(cells) - n) // 2
+    totals = np.array([0.0] + [t.total_root_depth for t in types], dtype="<f4")
+    for row, col in cells[first:first + n]:
+        depth[row, col] = totals[veg[row, col]]
+    row, col = (int(v) for v in cells[first])
+    return Mutated(MUTATIONS["shallow-soil"][0], {SOIL_DEPTH: depth.tobytes()},
+                   [f"soil depth ({path.name}): {n} basin cells from row {row}, column {col} "
+                    "set to the total root depth of their vegetation class "
+                    f"({float(totals[veg[row, col]]):.6g} m there)"])
+
+
+_STATE_KINDS = {"canopy interception state": "Interception", "snow state": "Snow",
+                "soil state": "Soil"}
+
+
+def _state_mutant(case: DhsvmCase, name: str, label: str, data: bytes,
+                  change: str) -> Mutated:
+    """A mutant whose state directory holds ``data`` as the ``label`` state and links to
+    the other state files DHSVM reads at start-up."""
+    stamp = state_stamp(case)
+    tree: dict[str, bytes] = {}
+    links: dict[str, Path] = {}
+    for spec in state_files(case):
+        new_name = f"state/{_STATE_KINDS[spec.label]}.State.{stamp}.bin"
+        if spec.label == label:
+            tree[new_name] = data
+        elif spec.path.is_file():
+            links[new_name] = spec.path
+    for kind in ("Channel", "Hydrograph"):  # tables DHSVM reads from the same place
+        table = case.start_path(f"{case.state_prefix}{kind}.State.{stamp}")
+        if table.is_file():
+            links[f"state/{kind}.State.{stamp}"] = table
+    return Mutated(MUTATIONS[name][0], {}, [change], values={STATE_DIRECTORY: "{out}/state/"},
+                   tree=tree, links=links)
+
+
+def _state_spec(case: DhsvmCase, label: str) -> MapSpec:
+    specs = {s.label: s for s in state_files(case)}
+    if label not in specs:
+        raise MutationError(f"no state {label!r}; choose from {', '.join(specs)}")
+    if not specs[label].path.is_file():
+        raise MutationError(f"the setup has no {specs[label].path}")
+    return specs[label]
+
+
+@_operator(MutationInfo(
+    name="truncate-state",
+    title="Cut a state file short",
+    targets=("DHSVM-STA-001",),
+    description=(
+        "Keep only the first half of one gridded state file (the soil state, or the one "
+        "whose label is given as `state`, e.g. 'snow state'), as after an interrupted copy."
+    ),
+    dhsvm="stops when it restores the model state: 'Error while reading file', exit 2",
+))
+def truncate_state(case: DhsvmCase, params: dict) -> Mutated:
+    label = str(params.get("state", "soil state"))
+    spec = _state_spec(case, label)
+    data = spec.path.read_bytes()
+    return _state_mutant(case, "truncate-state", label, data[: len(data) // 2],
+                         f"{label} ({spec.path.name}): {len(data)} -> {len(data) // 2} bytes")
+
+
+@_operator(MutationInfo(
+    name="state-extra-layer",
+    title="Write the soil state for one more soil layer",
+    targets=("DHSVM-STA-001",),
+    description=(
+        "Write the soil state as a setup with one more soil layer would: one more moisture "
+        "data set and one more temperature data set (copies of the last layer's), which "
+        "makes the file two data sets longer."
+    ),
+    dhsvm="reports no error and runs to the end, but takes every variable after the "
+          "moisture layers from the wrong data set; on Chiwawa soil temperatures become "
+          "surface water and the first flows are more than 100 times larger",
+))
+def state_extra_layer(case: DhsvmCase, params: dict) -> Mutated:
+    spec = _state_spec(case, "soil state")
+    g = case.grid
+    n_soil = (spec.layers - 4) // 2
+    data = np.fromfile(spec.path, dtype="<f4")
+    if data.size != spec.layers * g.nrows * g.ncols:
+        raise MutationError(f"{spec.path} does not hold {spec.layers} data sets of "
+                            f"{g.nrows} x {g.ncols} 4-byte floats")
+    sets = data.reshape(spec.layers, g.nrows, g.ncols)
+    moist, surface = sets[: n_soil + 1], sets[n_soil + 1: n_soil + 2]
+    temps, rest = sets[n_soil + 2: 2 * n_soil + 2], sets[2 * n_soil + 2:]
+    longer = np.concatenate([moist, moist[-1:], surface, temps, temps[-1:], rest])
+    return _state_mutant(case, "state-extra-layer", "soil state", longer.tobytes(),
+                         f"soil state ({spec.path.name}): {spec.layers} -> {len(longer)} data "
+                         f"sets, as for {n_soil + 1} soil layers")
+
+
+@_operator(MutationInfo(
+    name="missing-output-dir",
+    title="Name an output directory that does not exist",
+    targets=("DHSVM-RUN-002",),
+    description="Set Output Directory to no-such-directory/, which is not created.",
+    dhsvm="stops when it opens its first output file, after reading the maps and the "
+          "network: 'Cannot open file: no-such-directory/Aggregated.Values', exit 3",
+))
+def missing_output_dir(case: DhsvmCase, params: dict) -> Mutated:
+    new = "no-such-directory/"
+    if case.start_path(new).exists():
+        raise MutationError(f"{case.start_path(new)} exists")
+    return Mutated(MUTATIONS["missing-output-dir"][0], {},
+                   [f"Output Directory: {case.output_prefix!r} -> {new!r}"],
+                   values={OUTPUT_DIRECTORY: new})
+
+
+@_operator(MutationInfo(
+    name="output-no-slash",
+    title="Drop the '/' at the end of the output directory",
+    targets=("DHSVM-RUN-002",),
+    description="Remove the '/' that ends Output Directory.",
+    dhsvm="runs to the end, but writes its output next to the directory, under names that "
+          "start with the directory's name (outputAggregated.Values for output)",
+))
+def output_no_slash(case: DhsvmCase, params: dict) -> Mutated:
+    old = case.output_prefix
+    new = old.rstrip("/")
+    if new == old or not new:
+        raise MutationError(f"Output Directory = {old!r} has no '/' at its end to remove")
+    return Mutated(MUTATIONS["output-no-slash"][0], {},
+                   [f"Output Directory: {old!r} -> {new!r}"], values={OUTPUT_DIRECTORY: new})
+
+
 # ------------------------------------------------------------------ writing
 def mutate_case(case: DhsvmCase, name: str, out_dir: str | Path,
                 params: dict | None = None) -> tuple[Path, Mutated]:
     """Write the mutant's files and ``out_dir/INPUT.<name>``.
 
-    Each replaced file keeps its name and goes to ``out_dir``. The new INPUT
-    differs from the original only in the entries that name those files, which
-    point to the new files by absolute path, so the mutated setup runs from the
-    same working directory as the original.
+    Each replaced file keeps its name and goes to ``out_dir``, as do the files of the
+    mutant's own. The new INPUT differs from the original only in the entries that name
+    replaced files, which point to the new files by absolute path, and in the entries the
+    mutant changes, so the mutated setup runs from the same working directory as the
+    original.
     """
     if name not in MUTATIONS:
         raise MutationError(f"unknown mutation {name!r}; choose from {', '.join(MUTATIONS)}")
@@ -538,6 +716,26 @@ def mutate_case(case: DhsvmCase, name: str, out_dir: str | Path,
         new_path = (out_dir / case.path(section, key).name).resolve()
         new_path.write_bytes(content)
         config = config.with_value(section, key, str(new_path))
+    root = out_dir.resolve()
+    for rel, content in mutated.tree.items():
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_bytes(content)
+    for rel, source in mutated.links.items():
+        target = root / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.unlink(missing_ok=True)
+        try:
+            target.symlink_to(source.resolve())
+        except OSError:  # no symbolic links here: copy instead
+            shutil.copyfile(source, target)
+    for (section, key), value in mutated.values.items():
+        value = value.replace("{out}", str(root))
+        if (section, key) == STATE_DIRECTORY and len(value) > STATE_PREFIX_MAX:
+            raise MutationError(
+                f"the mutant's state directory {value} has {len(value)} characters, but "
+                f"DHSVM has room for {STATE_PREFIX_MAX} in front of a state file name "
+                "(InitModelState.c:57); choose a shorter output directory")
+        config = config.with_value(section, key, value)
     input_path = out_dir / f"INPUT.{name}"
     config.write(input_path)
     return input_path, mutated

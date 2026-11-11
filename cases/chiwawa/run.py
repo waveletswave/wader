@@ -16,7 +16,10 @@ Checks after the run:
 * the final mass balance error is below 1 mm.
 
 ``--input`` runs another INPUT file (for example one written by ``wader mutate``)
-from a run directory of the same case. A summary is written to
+from a run directory of the same case. ``--keep-output`` leaves that INPUT's
+Output Directory as it is, for experiments on where DHSVM writes; the run
+directory still gets an empty ``output/``, and the output files are then not
+checked. A summary is written to
 ``<run>/summary.json`` and the last line of stdout is the run directory.
 """
 
@@ -88,6 +91,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--end", default=DEFAULT_END, help=f"Model End (default {DEFAULT_END})")
     ap.add_argument("--dhsvm", type=Path, default=None,
                     help="DHSVM executable (default: $WADER_DHSVM or the cached build)")
+    ap.add_argument("--keep-output", action="store_true",
+                    help="do not set Output Directory to output/; skip the output checks")
     ap.add_argument("--timeout", type=int, default=3600)
     a = ap.parse_args(argv)
 
@@ -116,7 +121,8 @@ def main(argv: list[str] | None = None) -> int:
         shutil.rmtree(work)
     (work / "output").mkdir(parents=True)
     config = config.with_value("TIME", "Model End", a.end)
-    config = config.with_value("OUTPUT", "Output Directory", "output/")
+    if not a.keep_output:
+        config = config.with_value("OUTPUT", "Output Directory", "output/")
     config.write(work / "INPUT")
 
     print(f"Running DHSVM in {work} ({start:%Y-%m-%d} to {end:%Y-%m-%d}) ...", file=sys.stderr)
@@ -136,7 +142,7 @@ def main(argv: list[str] | None = None) -> int:
                      "start": f"{start:%m/%d/%Y-%H}", "end": a.end,
                      "exit_code": proc.returncode, "seconds": round(seconds, 1)}
     flow_file = work / "output" / "Streamflow.Only"
-    if not problems:
+    if not problems and not a.keep_output:
         names, dates, rows = read_streamflow(flow_file)
         expected = int((end - start) / step) + 1
         if len(dates) != expected:

@@ -7,6 +7,7 @@ from datetime import datetime
 from wader.models.dhsvm.config import (
     DhsvmConfig,
     c_float,
+    c_floats,
     c_int,
     make_key_string,
     scan_date,
@@ -93,3 +94,13 @@ def test_scan_date_follows_sscandate():
     assert scan_date("10/01/1970-24") is None  # hours are 0..23
     assert scan_date("1970-10") is None  # fewer than three numbers
     assert scan_date("1970-10-01") is None  # read as month 1970
+
+
+def test_c_floats_reads_like_copyfloat():
+    # GetInit.c:311-327: n numbers, one strtod after another
+    assert c_floats("0.060 0.130 0.210", 3) == [0.06, 0.13, 0.21]
+    assert c_floats("1e-1\t2", 2) == [0.1, 2.0]
+    assert c_floats("0.1 0.2", 3) is None  # a number is missing
+    assert c_floats("0.1 0.2 0.3", 2) is None  # something follows the last one
+    assert c_floats("0.1, 0.2", 2) is None
+    assert c_floats("anything", 0) == []  # nothing is read and nothing is checked
