@@ -42,6 +42,7 @@ import numpy as np
 DEM_DTYPE = np.dtype("<f4")  # VarID.c:51-53, NC_FLOAT
 MASK_DTYPE = np.dtype("u1")  # VarID.c:54-55, NC_BYTE
 SOIL_DEPTH_DTYPE = np.dtype("<f4")  # VarID.c:58-60, NC_FLOAT
+VEG_TYPE_DTYPE = np.dtype("u1")  # VarID.c:61-63, NC_BYTE
 
 ID_MAX = 65535  # SegmentID and ClassID are unsigned short (channel.h:16)
 

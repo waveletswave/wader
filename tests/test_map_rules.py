@@ -1,15 +1,17 @@
-"""MAP-001 on the synthetic case: which binary maps DHSVM reads and how many bytes."""
+"""MAP rules on the synthetic case: which binary maps DHSVM reads and how many bytes
+(MAP-001), and soil depth against root depth (MAP-003)."""
 
 from __future__ import annotations
 
 import numpy as np
 import pytest
-from conftest import INPUT_TEMPLATE, NCOLS, NROWS, make_synthetic_case
+from conftest import INPUT_TEMPLATE, NCOLS, NROWS, ROOT_DEPTH, make_synthetic_case
 
 from wader.core import Outcome, Severity
 from wader.models import dhsvm
 from wader.models.dhsvm.case import DhsvmCase
 from wader.models.dhsvm.maps import _shadow_layers, expected_maps, max_soil_layers
+from wader.models.dhsvm.mutate import mutate_case
 
 CELLS = NROWS * NCOLS
 
@@ -152,3 +154,106 @@ def test_missing_entry_for_a_required_map_is_not_evaluated(work):
     set_input(work, ("Soil Map File        = input/soil.bin\n", ""))
     res = check(work)
     assert res.outcome == Outcome.ERROR and "Soil Map File" in res.summary
+
+
+# ------------------------------------------------------------------ MAP-003
+def check3(work, **params):
+    return dhsvm.check(work / "INPUT.synthetic", work, rules=["MAP-003"],
+                       params=params or None).results[0]
+
+
+def single_sum(*depths):
+    """The sum as DHSVM forms it: accumulated in single precision (CheckOut.c:81-84)."""
+    total = np.float32(0.0)
+    for d in depths:
+        total = np.float32(total + np.float32(d))
+    return total
+
+
+def write_depth(work, cells):
+    depth = np.full((NROWS, NCOLS), 1.5, dtype="<f4")
+    for (row, col), value in cells.items():
+        depth[row, col] = value
+    depth.tofile(work / "input" / "soild.bin")
+
+
+def test_soil_deeper_than_roots_everywhere(work):
+    res = check3(work)
+    assert res.outcome == Outcome.PASS and not res.findings
+    assert "188 basin cells" in res.summary and "0.75 m" in res.summary
+    assert res.metrics["tested_cells"] == CELLS - 4  # the four corners are outside the basin
+    assert res.metrics["min_margin_m"] == pytest.approx(1.5 - ROOT_DEPTH, abs=1e-6)
+    # only the class that is on the map is listed; class 2 is in the table only
+    assert [c["class"] for c in res.metrics["classes"]] == [1]
+    assert res.metrics["classes"][0]["total_root_depth_m"] == float(single_sum(0.10, 0.25, 0.40))
+
+
+def test_the_comparison_is_dhsvms_single_precision_one(work):
+    total = single_sum(0.10, 0.25, 0.40)
+    write_depth(work, {(5, 5): total})  # equal: DHSVM stops on "<="
+    res = check3(work)
+    assert res.outcome == Outcome.FAIL
+    (f,) = res.findings
+    assert f.severity == Severity.ERROR and res.rule.level == "L0"
+    assert f.where["n_cells"] == 1 and f.where["cells"] == [[5, 5]]
+    assert "exit 255" in f.message and "row 5, column 5" in f.message
+    assert "vegetation class 1 (Forest)" in f.message
+    # one single-precision step deeper is enough for DHSVM, and for wader
+    write_depth(work, {(5, 5): np.nextafter(total, np.float32(np.inf))})
+    res = check3(work)
+    assert res.outcome == Outcome.PASS
+    assert "in 1 cells the layer below the root zones is thinner than 0.05 m" in res.summary
+    assert check3(work, thin_layer_m=1e-9).summary.endswith("m)")
+
+
+def test_cells_outside_the_basin_do_not_count(work):
+    write_depth(work, {(0, 0): 0.0, (15, 11): -9999.0})  # corners, outside the mask
+    assert check3(work).outcome == Outcome.PASS
+
+
+def test_each_cell_is_compared_with_its_own_class(work):
+    veg = np.ones((NROWS, NCOLS), dtype="u1")
+    veg[8:, :] = 2  # class 2: root zones 0.10 + 0.20 + 0.30
+    veg.tofile(work / "input" / "veg.bin")
+    write_depth(work, {(2, 2): 0.7, (10, 2): 0.7, (12, 3): single_sum(0.10, 0.20, 0.30)})
+    res = check3(work)
+    assert res.outcome == Outcome.FAIL
+    by_class = {f.where["vegetation_class"]: f for f in res.findings}
+    assert sorted(by_class) == [1, 2]
+    assert by_class[1].where["cells"] == [[2, 2]]  # 0.7 m is too shallow for class 1 only
+    assert by_class[2].where["cells"] == [[12, 3]]
+    assert res.metrics["failing_cells"] == 2
+
+
+def test_a_class_that_is_not_in_the_table_is_reported(work):
+    veg = np.ones((NROWS, NCOLS), dtype="u1")
+    veg[3, 3], veg[4, 4], veg[0, 0] = 0, 7, 9  # (0, 0) is outside the basin
+    veg.tofile(work / "input" / "veg.bin")
+    res = check3(work)
+    assert res.outcome == Outcome.FAIL
+    (f,) = res.findings
+    assert f.where["cells"] == [[3, 3], [4, 4]] and f.values["vegetation_classes"] == [0, 7]
+    assert "veg value N out of range" in f.message
+    assert res.metrics["untested_cells"] == 2 and "2 more could not be tested" in res.summary
+
+
+def test_shallow_soil_mutation_is_caught(work, tmp_path):
+    case = DhsvmCase(work / "INPUT.synthetic", work)
+    mutated, _ = mutate_case(case, "shallow-soil", tmp_path / "mut")
+    res = dhsvm.check(mutated, work, rules=["MAP-003"]).results[0]
+    assert res.outcome == Outcome.FAIL
+    assert [f.where["n_cells"] for f in res.findings] == [9]
+
+
+@pytest.mark.parametrize("old, new, message", [
+    ("Root Zone Depths 1   = 0.10 0.25 0.40", "Root Zone Depths 1   = 0.10 0.25",
+     "is not 3 numbers"),
+    ("Root Zone Depths 1   = 0.10 0.25 0.40", "Root Zone Depths 1   = 0.10 0.25 0.40 0.5",
+     "is not 3 numbers"),
+    ("Overstory Present 1  = TRUE", "Overstory Present 1  = yes", "is not TRUE or FALSE"),
+    ("Number of Root Zones 1 = 3\n", "", "Number of Root Zones 1"),
+])
+def test_a_vegetation_table_dhsvm_rejects_is_an_input_problem(work, old, new, message):
+    set_input(work, (old, new))
+    res = check3(work)
+    assert res.outcome == Outcome.ERROR and message in res.summary

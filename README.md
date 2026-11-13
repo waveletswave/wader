@@ -18,8 +18,8 @@ relies on, with a source location in
 that behaviour was verified in the source, verified by running DHSVM, reported
 by others, or not yet verified.
 
-Status: pre-alpha (milestone M1 in progress). Nine rules so far, for the stream network
-files and the binary maps; see below.
+Status: pre-alpha (milestone M1 in progress). Twelve rules so far, for the stream network
+files, the binary maps, the model state and the output directory; see below.
 
 ## Install
 
@@ -48,6 +48,7 @@ Exit codes: 0 no error findings, 1 error findings (`--strict`: warnings too),
 | ID | What it checks | Level | Caught mutations |
 |---|---|---|---|
 | DHSVM-MAP-001 | Every binary map DHSVM reads exists and holds exactly rows x columns x data sets values of its number type. A short file stops DHSVM; a long one is read without a message, as different numbers | L0/L1 | `truncate-map`, `float64-dem` |
+| DHSVM-MAP-003 | In every basin cell the soil is deeper than the total root depth of the cell's vegetation class; otherwise DHSVM stops before it reads the network | L0 | `shallow-soil` |
 | DHSVM-NET-001 | DHSVM accepts every stream network record: readable fields; ID and order of at least 1; slope and length above 0; IDs unique and at most 65535 | L0/L1 | `zero-slope` |
 | DHSVM-NET-003 | Every positive outlet ID names a segment; the links form no cycle; some segment leaves the network | L0/L1 | `dangling-outlet`, `cycle` |
 | DHSVM-NET-004 | No link runs uphill: a segment's outlet segment is not higher (lowest DEM cell, tolerance 1 m) | L1 | `reverse-network` |
@@ -56,6 +57,8 @@ Exit codes: 0 no error findings, 1 error findings (`--strict`: warnings too),
 | DHSVM-NET-007 | DHSVM accepts every stream map record (inside the grid, known segment, no negative value, no negative soil depth in its cell) and uses it (inside the basin mask); no in-basin cell has a channel length of 0; every segment has a record | L0/L1 | `map-swap-row-col`, `zero-length-record` |
 | DHSVM-NET-010 | Every class a segment uses is defined, with width, bank height and Manning's n above 0; bank height and Manning's n of the classes in use are plausible | L0/L1/L2 | `missing-class`, `placeholder-classes` |
 | DHSVM-NET-013 | The outlet ID is written so DHSVM reads it as an outlet (DHSVM reads `-1` as segment `1`) | L1 | `negative-outlet` |
+| DHSVM-RUN-002 | The output directory exists before the run (DHSVM does not create it and stops after reading all its input), and `Output Directory` ends with `/` (otherwise the output lands next to the directory) | L0/L1 | `missing-output-dir`, `output-no-slash` |
+| DHSVM-STA-001 | The interception, snow and soil state files that DHSVM restores at start-up exist under the names it builds and hold exactly the data sets it reads for the setup's canopy and soil layers. A short file stops DHSVM; a long one is read without a message, with variables taken from the wrong data sets | L0/L1 | `truncate-state`, `state-extra-layer` |
 
 Levels: L0 = DHSVM stops with an error; L1 = DHSVM accepts the input but results
 are wrong, the input is silently changed, or the run crashes; L2 = physical
@@ -73,6 +76,13 @@ DHSVM `e6f333d` on the Chiwawa case with one thing changed
 | The DEM is written as 8-byte floats | no read error; stops at the first time step with an unrelated error 47 | MAP-001 |
 | Class bank heights are PNNL's template placeholders (0.03-0.10 m) | exit 0; the hydrograph changes. Class widths, in contrast, are never used | NET-010 |
 | An outlet ID is written as 65539 | exit 0; read as segment 3 | NET-003 |
+| The soil state file is written for one more soil layer (two data sets too many) | exit 0, no message; soil temperatures are read as surface water, and the first outlet flows are over 100 times larger | STA-001 |
+| `Output Directory` lacks its final `/` | exit 0; the output is written next to the directory, as `outputStreamflow.Only` and so on | RUN-002 |
+
+wader also reports two things in the Chiwawa test case as distributed. Its
+outlet is written as `-1`, which DHSVM reads as segment 1 (NET-013). And its
+INPUT names an output directory that the repository does not contain, so DHSVM
+reads all the input and then stops until someone creates it (RUN-002).
 
 ## Reference cases and data
 

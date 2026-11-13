@@ -5,12 +5,14 @@ Every run uses the Chiwawa case and differs from it in one thing. The tests are 
 experimental evidence (status ``verified-experiment``) that the rules cite. The first
 group runs five days (to 10/06/1970-00) and backs DHSVM-NET-004/005/006/013; the second
 runs two days (to 10/03/1970-00), or stops at start-up, and backs DHSVM-NET-001/003/007/
-010 and DHSVM-MAP-001. The last tests record upstream behaviour that no rule uses yet.
+010 and DHSVM-MAP-001; the third does the same for DHSVM-MAP-003, DHSVM-STA-001 and
+DHSVM-RUN-002. The last tests record upstream behaviour that no rule uses yet.
 """
 
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -22,6 +24,7 @@ from conftest import REPO
 from wader.cache import chiwawa_dir
 from wader.models.dhsvm.case import DhsvmCase
 from wader.models.dhsvm.io import replace_token, rewrite_network
+from wader.models.dhsvm.maps import state_files
 from wader.models.dhsvm.mutate import MUTATIONS, mutate_case
 
 pytestmark = [pytest.mark.dhsvm, pytest.mark.case_data]
@@ -102,11 +105,13 @@ SOIL_DEPTH = ("SOILS", "Soil Depth File")
 READ_ERROR = "Error reading input in file"  # ReportError 5 (ReportError.c:28)
 
 
-def run_any(input_path: Path, name: str, dhsvm_bin: Path, end: str = SHORT_END) -> dict:
-    """Run DHSVM whether it succeeds or not: run.py's summary, the log, the output files."""
+def run_any(input_path: Path, name: str, dhsvm_bin: Path, end: str = SHORT_END,
+            keep_output: bool = False) -> dict:
+    """Run DHSVM whether it succeeds or not: run.py's summary, the log, the output files.
+    With ``keep_output`` the INPUT's own Output Directory is used."""
     subprocess.run(
         [sys.executable, str(RUN), "--input", str(input_path), "--name", name, "--end", end,
-         "--dhsvm", str(dhsvm_bin)],
+         "--dhsvm", str(dhsvm_bin), *(["--keep-output"] if keep_output else [])],
         capture_output=True, text=True,
     )
     work = chiwawa_dir() / "run" / name
@@ -116,6 +121,8 @@ def run_any(input_path: Path, name: str, dhsvm_bin: Path, end: str = SHORT_END) 
     summary["warning_lines"] = sum("warning" in ln for ln in summary["log"].lower().splitlines())
     summary["outputs"] = {p.name: p.read_bytes()
                           for p in sorted((work / "output").iterdir()) if p.is_file()}
+    summary["beside_output"] = {p.name: p.read_bytes() for p in sorted(work.iterdir())
+                                if p.is_file() and p.name.startswith("output")}
     return summary
 
 
@@ -158,14 +165,19 @@ STOPS = {
     "map-swap-row-col": (5, "bad coordinates"),
     "missing-class": (5, "segment 1: channel class 19 not found"),
     "truncate-map": (2, "Error while reading file"),
+    "shallow-soil": (255, "Soil depth is 0.400000, Root depth is 0.400000"),
+    "truncate-state": (2, "Error while reading file"),
+    "missing-output-dir": (3, "Cannot open file: no-such-directory/Aggregated.Values"),
 }
+KEEP_OUTPUT = {"missing-output-dir"}  # mutants of the Output Directory entry itself
 
 
 @pytest.mark.parametrize("mutation", sorted(STOPS))
-def test_dhsvm_stops_on_mutant(mutation, case, dhsvm_bin, tmp_path):
+def test_dhsvm_stops_on_mutant(mutation, case, dhsvm_bin, short_tmp):
     status, message = STOPS[mutation]
-    mutated, _ = mutate_case(case, mutation, tmp_path / "mut")
-    got = run_any(mutated, f"pytest-{mutation}", dhsvm_bin)
+    mutated, _ = mutate_case(case, mutation, short_tmp / "mut")
+    got = run_any(mutated, f"pytest-{mutation}", dhsvm_bin,
+                  keep_output=mutation in KEEP_OUTPUT)
     assert got["exit_code"] == status, got["log"][-2000:]
     assert message in got["log"]
     assert (READ_ERROR in got["log"]) == (status == 5)
@@ -329,10 +341,130 @@ def test_chiwawa_canopy_gap_map_is_too_short(case, dhsvm_bin, tmp_path):
     assert "Error while reading file: ../../TestCase/Chiwawa/input/CanopyGap.bin" in got["log"]
 
 
+# ====================================================================================
+# Root depth, state files and the output directory: what DHSVM does with the inputs that
+# MAP-003, STA-001 and RUN-002 report.
+# ====================================================================================
+OUTPUT_DIR = ("OUTPUT", "Output Directory")
+STATE_DIR = ("OUTPUT", "Initial State Directory")
+STAMP = "10.01.1970.00.00.00"  # Model Start of the case, as in its state file names
+
+
+def test_soil_one_step_deeper_than_the_roots_is_accepted(case, dhsvm_bin, tmp_path):
+    """The other side of ``shallow-soil``: DHSVM stops on soil depth <= root depth and
+    accepts the next single-precision number (CheckOut.c:139)."""
+    mutated, _ = mutate_case(case, "shallow-soil", tmp_path / "mut")
+    old = np.fromfile(case.path(*SOIL_DEPTH), dtype="<f4")
+    new = np.fromfile(DhsvmCase(mutated, case.workdir).path(*SOIL_DEPTH), dtype="<f4")
+    changed = old != new
+    assert changed.sum() == 9
+    new[changed] = np.nextafter(new[changed], np.float32(np.inf))
+    got = run_any(variant(case, tmp_path / "v", {SOIL_DEPTH: new.tobytes()}), "pytest-deeper",
+                  dhsvm_bin)
+    assert got["exit_code"] == 0 and not got["problems"]
+
+
+def linked_states(case: DhsvmCase, directory: Path, skip: tuple = ()) -> Path:
+    """Links in ``directory`` to the state files DHSVM reads when it starts the case."""
+    directory.mkdir(parents=True, exist_ok=True)
+    paths = [s.path for s in state_files(case) if s.label not in skip]
+    paths.append(case.start_path(f"{case.state_prefix}Channel.State.{STAMP}"))
+    for path in paths:
+        (directory / path.name).symlink_to(path.resolve())
+    return directory
+
+
+def test_dhsvm_stops_on_a_missing_state_file(case, dhsvm_bin, short_tmp):
+    states = linked_states(case, short_tmp / "state", skip=("snow state",))
+    got = run_any(variant(case, short_tmp / "v", values={STATE_DIR: f"{states}/"}),
+                  "pytest-nostate", dhsvm_bin)
+    assert got["exit_code"] == 3
+    assert f"Cannot open file: {states}/Snow.State.{STAMP}.bin" in got["log"]
+
+
+def first_flow(streamflow: bytes) -> float:
+    """Outlet flow of the first time step in Streamflow.Only (m3 per step)."""
+    for line in streamflow.decode().splitlines()[1:]:
+        fields = line.split()
+        if len(fields) > 1:
+            return float(fields[1])
+    raise AssertionError("Streamflow.Only has no flow record")
+
+
+def test_state_written_for_more_soil_layers_floods_the_basin(case, short_baseline, dhsvm_bin,
+                                                             short_tmp):
+    """Soil.State with 12 data sets where DHSVM reads 10: it reads the first 10 and says
+    nothing. Moisture is right; the surface temperature is the lowest layer's moisture,
+    the layer temperatures are shifted by one, and the ground heat storage and the
+    surface water are soil temperatures (InitModelState.c:308-390)."""
+    mutated, _ = mutate_case(case, "state-extra-layer", short_tmp / "mut")
+    got = run_any(mutated, "pytest-state-extra-layer", dhsvm_bin)
+    assert got["exit_code"] == 0 and "END OF MODEL RUN" in got["log"]
+    assert first_flow(got["outputs"]["Streamflow.Only"]) > 100 * first_flow(
+        short_baseline["outputs"]["Streamflow.Only"])
+
+
+def run_directly(name: str, config, dhsvm_bin: Path, setup) -> subprocess.CompletedProcess:
+    """Run DHSVM in ``<case>/run/<name>/`` after ``setup(work)`` has put files there
+    (run.py always starts from an empty run directory)."""
+    work = chiwawa_dir() / "run" / name
+    shutil.rmtree(work, ignore_errors=True)
+    (work / "output").mkdir(parents=True)
+    setup(work)
+    config = config.with_value("TIME", "Model End", SHORT_END)
+    config.with_value(*OUTPUT_DIR, "output/").write(work / "INPUT")
+    return subprocess.run([str(dhsvm_bin), "INPUT"], cwd=work, capture_output=True, text=True,
+                          errors="replace")
+
+
+def test_empty_state_directory_means_the_start_directory(case, dhsvm_bin):
+    """InitDump.c:101-103 falls back to the output directory when Initial State Directory
+    is empty, and then overwrites the fallback with the empty text."""
+    config = case.config.with_value(*STATE_DIR, "")
+    proc = run_directly("pytest-state-in-output", config, dhsvm_bin,
+                        lambda work: linked_states(case, work / "output"))
+    assert proc.returncode == 3
+    assert f"Cannot open file: Channel.State.{STAMP}" in proc.stdout + proc.stderr  # bare name
+    proc = run_directly("pytest-state-in-start-dir", config, dhsvm_bin,
+                        lambda work: linked_states(case, work))
+    assert proc.returncode == 0 and "END OF MODEL RUN" in proc.stdout
+
+
+def test_dhsvm_stops_on_an_empty_output_directory(case, dhsvm_bin, tmp_path):
+    got = run_any(variant(case, tmp_path / "v", values={OUTPUT_DIR: ""}), "pytest-no-output",
+                  dhsvm_bin, keep_output=True)
+    assert got["exit_code"] == 51 and "Key not found or invalid entry" in got["log"]
+
+
+def test_chiwawa_as_distributed_has_no_output_directory(chiwawa_input, dhsvm_bin):
+    """The INPUT of the test case names TestCase/Chiwawa/output/, which the repository
+    does not contain: DHSVM stops until someone creates it."""
+    assert not (chiwawa_dir() / "TestCase" / "Chiwawa" / "output").exists()
+    got = run_any(chiwawa_input, "pytest-as-distributed", dhsvm_bin, keep_output=True)
+    assert got["exit_code"] == 3
+    assert "Cannot open file: ../../TestCase/Chiwawa/output/Aggregated.Values" in got["log"]
+
+
+def test_output_directory_without_a_slash(case, short_baseline, dhsvm_bin, tmp_path):
+    base = variant(case, tmp_path / "base", values={OUTPUT_DIR: "output/"})
+    mutated, _ = mutate_case(DhsvmCase(base, case.workdir), "output-no-slash",
+                             tmp_path / "mut")
+    got = run_any(mutated, "pytest-output-no-slash", dhsvm_bin, keep_output=True)
+    assert got["exit_code"] == 0 and "END OF MODEL RUN" in got["log"]
+    assert not got["outputs"]  # nothing in output/ ...
+    # ... the same results are next to it, under names that start with "output"
+    assert sorted(got["beside_output"]) == [
+        "outputAggregated.Values", "outputMass.Balance", "outputMass.Final.Balance",
+        "outputStream.Flow", "outputStreamflow.Only", "outputsaturation_extent.txt"]
+    assert got["beside_output"]["outputStreamflow.Only"] == short_baseline["outputs"][
+        "Streamflow.Only"]
+
+
 def test_every_mutation_has_a_dhsvm_experiment():
     runs = {"reverse-network", "jump", "force-wire",  # test_dhsvm_runs_mutants_without_complaint
             "negative-outlet",  # Chiwawa as shipped: test_negative_outlet_is_read_as_segment_1
-            "cycle", "zero-length-record", "placeholder-classes", "float64-dem"}
+            "cycle", "zero-length-record", "placeholder-classes", "float64-dem",
+            "state-extra-layer", "output-no-slash"}
     assert runs | set(STOPS) == set(MUTATIONS)
 
 

@@ -9,7 +9,9 @@ and anything beyond that is ignored.
 
 ``expected_maps`` lists the maps this module knows how to predict, each with
 the source location of the read. ``unchecked_inputs`` names gridded inputs
-that the setup enables but that are not predicted yet.
+that the setup enables but that are not predicted yet. ``state_files`` lists
+the gridded state files that DHSVM restores at start-up, which it reads with
+the same routine.
 
 All source references are to pnnl/DHSVM-PNNL@e6f333d, DHSVM/sourcecode/
 (verified-source).
@@ -45,6 +47,13 @@ class MapSpec:
 
     def layer_bytes(self, nrows: int, ncols: int) -> int:
         return nrows * ncols * self.dtype.itemsize
+
+    def reads(self, nrows: int, ncols: int) -> str:
+        """What DHSVM reads from the file, in words."""
+        kind = "float" if self.dtype.kind == "f" else "integer"
+        sets = f" x {self.layers} data sets" if self.layers > 1 else ""
+        return (f"{self.expected_bytes(nrows, ncols)} bytes ({nrows} rows x {ncols} columns x "
+                f"{self.dtype.itemsize}-byte {kind}{sets})")
 
 
 # Snow parameters that take a constant or, if the value is not a number, a map
@@ -190,3 +199,63 @@ def unchecked_inputs(case: DhsvmCase) -> list[str]:
     except InputProblem:
         pass
     return out
+
+
+# ------------------------------------------------------------------ state files
+STATE_DIRECTORY = ("OUTPUT", "Initial State Directory")
+
+
+def max_veg_layers(case: DhsvmCase) -> int:
+    """``Veg->MaxLayers``: the largest number of canopy layers over the vegetation types
+    of the table, whether the basin uses them or not (InitTables.c:329, 373-375)."""
+    return max((t.layers for t in case.veg_types), default=0)
+
+
+def state_stamp(case: DhsvmCase) -> str:
+    """The date in the names of the state files DHSVM restores: month, day, year, hour,
+    minute and second of Model Start (InitModelState.c:77-78; ChannelState.c:64-65)."""
+    t = case.period[0]
+    return f"{t.month:02d}.{t.day:02d}.{t.year:02d}.{t.hour:02d}.{t.minute:02d}.{t.second:02d}"
+
+
+def state_files(case: DhsvmCase) -> list[MapSpec]:
+    """The gridded state files DHSVM restores at start-up (format BIN).
+
+    Each name is the text of ``[OUTPUT] Initial State Directory`` followed directly by
+    ``<Kind>.State.<date>.bin`` (InitModelState.c:80, 166, 299; InitFileIO.c:95). Every
+    variable is a 4-byte float (VarID.c:119-128, 151-182, 195-232) and is one data set.
+    """
+    case._require_bin()
+    stamp = state_stamp(case)
+    n_veg, n_soil = max_veg_layers(case), max_soil_layers(case)
+
+    def spec(label: str, kind: str, layers: int, source: str) -> MapSpec:
+        name = f"{case.state_prefix}{kind}.State.{stamp}.bin"
+        return MapSpec(label, STATE_DIRECTORY, case.start_path(name), F4, layers, source)
+
+    return [
+        # rain and snow interception per canopy layer, then the temporary storage
+        spec("canopy interception state", "Interception", 2 * n_veg + 1,
+             "InitModelState.c:77-145"),
+        # snow flag, last snowfall, water equivalent, pack water, pack temperature,
+        # surface water, surface temperature, cold content
+        spec("snow state", "Snow", 8, "InitModelState.c:166-266"),
+        # moisture of each soil layer and of the layer below them, surface temperature,
+        # temperature of each soil layer, ground heat storage, surface water
+        spec("soil state", "Soil", 2 * n_soil + 4, "InitModelState.c:299-390"),
+    ]
+
+
+def unchecked_states(case: DhsvmCase) -> list[str]:
+    """State files DHSVM also reads at start-up that ``state_files`` does not cover."""
+    stamp = state_stamp(case)
+    try:
+        reason = case.network_reason
+    except InputProblem:
+        return []
+    if reason is None:
+        return [f"{case.state_prefix}Channel.State.{stamp}, a table with the water stored in "
+                "each segment (ChannelState.c:64-67)"]
+    if "UNIT" in reason:
+        return [f"{case.state_prefix}Hydrograph.State.{stamp} (InitModelState.c:429-435)"]
+    return []

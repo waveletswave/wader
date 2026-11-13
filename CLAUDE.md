@@ -74,6 +74,17 @@ independent of every generator, so that its verdicts can be trusted.
   or `dhsvm` (a DHSVM executable). They skip when the data are missing, unless
   `WADER_REQUIRE_CASES=1` is set. CI sets it, so these tests can never be
   skipped silently there.
+- **Findings in the reference case are tested as findings.** Chiwawa as
+  distributed fails DHSVM-NET-013 (its outlet is written as -1) and
+  DHSVM-RUN-002 (its INPUT names an output directory the repository does not
+  contain). `tests/test_chiwawa.py` asserts both, and tests the clean case of
+  those two rules on a copy of the INPUT with that one thing put right. Never
+  create files inside the cached case to make a test pass.
+- **State directories need short paths.** DHSVM builds state file names in a
+  128-character buffer (InitModelState.c:57), which leaves 85 characters for
+  the directory. `mutate_case` refuses a longer one, and tests that write a
+  state directory use the `short_tmp` fixture, because pytest's own temporary
+  paths can be longer than that.
 
 ## Commands
 
@@ -94,10 +105,10 @@ scripts/demo_reverse_network.sh          # the reversed-network demo
 src/wader/core/              rules, findings, registry, reports (model-independent)
 src/wader/models/dhsvm/      config.py  INPUT parser (DHSVM semantics), dates
                              io.py      binary maps, stream network/map/class tables
-                             case.py    a setup as DHSVM sees it (paths, grid, maps, period)
-                             maps.py    which binary maps DHSVM reads, and how many bytes
+                             case.py    a setup as DHSVM sees it (paths, grid, maps, tables, period)
+                             maps.py    which binary maps and state files DHSVM reads, and how many bytes
                              met.py     gridded-met file selection (InitGridMet port)
-                             rules/     net.py (NET-*), map.py (MAP-*); more groups to come
+                             rules/     net.py (NET-*), map.py (MAP-*), sta.py (STA-*), run.py (RUN-*)
                              mutate.py  error-injection operators
 src/wader/cli.py             wader check | rules | mutate | mutations
 cases/chiwawa/               fetch.py (sparse checkout), run.py (DHSVM run)

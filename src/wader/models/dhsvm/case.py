@@ -16,11 +16,12 @@ from pathlib import Path
 import numpy as np
 
 from wader.core.rules import InputProblem, NotApplicable
-from wader.models.dhsvm.config import ConfigError, DhsvmConfig, scan_date
+from wader.models.dhsvm.config import ConfigError, DhsvmConfig, c_floats, scan_date
 from wader.models.dhsvm.io import (
     DEM_DTYPE,
     MASK_DTYPE,
     SOIL_DEPTH_DTYPE,
+    VEG_TYPE_DTYPE,
     MapReadError,
     StreamClasses,
     StreamMap,
@@ -39,6 +40,17 @@ class Grid:
     cellsize: float  # [AREA] Grid spacing -> Map->DY = Map->DX (InitConstants.c:485-488)
     north: float  # [AREA] Extreme North -> Map->Yorig, north edge (InitConstants.c:460)
     west: float  # [AREA] Extreme West -> Map->Xorig, west edge (InitConstants.c:463)
+
+
+@dataclass(frozen=True)
+class VegType:
+    """One class of the [VEGETATION] table, as far as wader uses it."""
+
+    index: int  # class number as in the vegetation map, from 1
+    description: str
+    layers: int  # NVegLayers: overstory plus understory (InitTables.c:353-373)
+    root_depths: tuple[float, ...]  # Root Zone Depths, single precision (InitTables.c:583-585)
+    total_root_depth: float  # VType.TotalDepth, their single-precision sum (CheckOut.c:81-84)
 
 
 class DhsvmCase:
@@ -138,6 +150,80 @@ class DhsvmCase:
             m = read_bin_map(self.path("SOILS", "Soil Depth File"), g.nrows, g.ncols,
                              SOIL_DEPTH_DTYPE)
         return m.data.astype("float64")
+
+    @cached_property
+    def veg_type(self) -> np.ndarray:
+        """Vegetation class of each cell (Veg.Type, VarID.c:61-63;
+        InitTerrainMaps.c:570-575)."""
+        self._require_bin()
+        g = self.grid
+        with self._guard("vegetation type"):
+            m = read_bin_map(self.path("VEGETATION", "Vegetation Map File"), g.nrows, g.ncols,
+                             VEG_TYPE_DTYPE)
+        return m.data
+
+    @cached_property
+    def veg_types(self) -> list[VegType]:
+        """The classes of the [VEGETATION] table: canopy layers and root zones
+        (InitTables.c:314-316, 353-378, 583-585; CheckOut.c:81-84)."""
+        cfg = self.config
+        with self._guard("[VEGETATION]"):
+            n_types = cfg.get_int("VEGETATION", "Number of Vegetation Types")
+        out = []
+        for i in range(1, n_types + 1):
+            with self._guard(f"[VEGETATION] class {i}"):
+                layers = 0
+                for key in ("Overstory Present", "Understory Present"):
+                    value = cfg.require("VEGETATION", f"{key} {i}").value
+                    if value[:4] == "TRUE":
+                        layers += 1
+                    elif value[:5] != "FALSE":
+                        raise InputProblem(
+                            f"[VEGETATION] {key} {i} = {value!r} is not TRUE or FALSE; DHSVM "
+                            "stops (error 51, InitTables.c:355-371)")
+                n_zones = cfg.get_int("VEGETATION", f"Number of Root Zones {i}")
+                entry = cfg.require("VEGETATION", f"Root Zone Depths {i}")
+            depths = c_floats(entry.value, n_zones)
+            if depths is None:
+                raise InputProblem(
+                    f"line {entry.lineno}: [VEGETATION] Root Zone Depths {i} = {entry.value!r} "
+                    f"is not {n_zones} numbers (Number of Root Zones {i}); DHSVM stops "
+                    "(error 51, InitTables.c:583-585)")
+            singles = [np.float32(d) for d in depths]
+            total = np.float32(0.0)
+            for d in singles:  # accumulated in single precision, as in CheckOut.c:81-84
+                total = np.float32(total + d)
+            out.append(VegType(
+                index=i,
+                description=cfg.get("VEGETATION", f"Vegetation Description {i}", "") or "",
+                layers=layers,
+                root_depths=tuple(float(d) for d in singles),
+                total_root_depth=float(total),
+            ))
+        return out
+
+    # ------------------------------------------------ output and state files
+    def start_path(self, name: str) -> Path:
+        """A file name that DHSVM builds itself, resolved against the directory DHSVM is
+        started from."""
+        p = Path(name)
+        return p if p.is_absolute() else self.workdir / p
+
+    @cached_property
+    def output_prefix(self) -> str:
+        """``[OUTPUT] Output Directory`` exactly as written. DHSVM puts it in front of
+        every output file name without adding a separator (``"%sAggregated.Values"``,
+        InitDump.c:94, 137-146)."""
+        return self.config.get("OUTPUT", "Output Directory", "") or ""
+
+    @cached_property
+    def state_prefix(self) -> str:
+        """Prefix of the state files read at start-up: ``[OUTPUT] Initial State
+        Directory`` exactly as written (InitDump.c:103; MainDHSVM.c:221, 229-231). An
+        empty or missing entry gives an empty prefix, i.e. the directory DHSVM is started
+        from: the fallback to the output directory (InitDump.c:101-102) is overwritten by
+        the unconditional copy on line 103."""
+        return self.config.get("OUTPUT", "Initial State Directory", "") or ""
 
     # -------------------------------------------------------------- time
     @cached_property

@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from conftest import NCOLS, NROWS
+from conftest import NCOLS, NROWS, STAMP
 
 from wader.models.dhsvm.case import DhsvmCase
 from wader.models.dhsvm.config import DhsvmConfig
 from wader.models.dhsvm.io import read_stream_classes, read_stream_map, read_stream_network
+from wader.models.dhsvm.maps import state_files
 from wader.models.dhsvm.mutate import MUTATIONS, MutationError, mutate_case, routing_orders
 
 # operators that only rewire links: DHSVM must still read and route the result
@@ -46,19 +47,22 @@ def test_topology_mutations_stay_readable_and_routable(synthetic, tmp_path, name
 
 
 @pytest.mark.parametrize("name", sorted(MUTATIONS))
-def test_a_mutant_differs_only_in_the_files_it_names(synthetic, tmp_path, name):
+def test_a_mutant_differs_only_in_what_it_names(synthetic, short_tmp, name):
     path, work = synthetic
     case = DhsvmCase(path, work)
-    new_input, m = mutate_case(case, name, tmp_path / "mut", SYNTHETIC_PARAMS.get(name))
-    assert m.files and m.changes and m.info.dhsvm
+    new_input, m = mutate_case(case, name, short_tmp / "mut", SYNTHETIC_PARAMS.get(name))
+    assert (m.files or m.values) and m.changes and m.info.dhsvm
     mutant = DhsvmCase(new_input, work)
     for section, key in m.files:
         assert mutant.path(section, key).read_bytes() != case.path(section, key).read_bytes()
-    # the new INPUT differs from the original only in the entries for those files
+    for section, key in m.values:
+        assert mutant.config.get(section, key) != case.config.get(section, key)
+    # the new INPUT differs from the original only in the entries the mutant names
     old_lines = case.config.text.splitlines()
     new_lines = DhsvmConfig.read(new_input).text.splitlines()
     changed = [b for a, b in zip(old_lines, new_lines, strict=True) if a != b]
-    assert sorted(line.split("=")[0].strip() for line in changed) == sorted(k for _, k in m.files)
+    assert sorted(line.split("=")[0].strip() for line in changed) == sorted(
+        key for _, key in [*m.files, *m.values])
 
 
 def test_force_wire_needs_enough_headwaters(synthetic, tmp_path):
@@ -129,3 +133,64 @@ def test_binary_map_mutations(synthetic, tmp_path):
     mutate_case(case, "float64-dem", tmp_path / "f8")
     f8 = np.fromfile(tmp_path / "f8" / "dem.bin", dtype="<f8").reshape(NROWS, NCOLS)
     assert (f8 == case.dem).all()
+
+
+def test_shallow_soil_changes_the_given_number_of_basin_cells(synthetic, tmp_path):
+    path, work = synthetic
+    case = DhsvmCase(path, work)
+    new_input, m = mutate_case(case, "shallow-soil", tmp_path / "mut", {"cells": 4})
+    old = np.fromfile(case.path("SOILS", "Soil Depth File"), dtype="<f4")
+    new = np.fromfile(DhsvmCase(new_input, work).path("SOILS", "Soil Depth File"), dtype="<f4")
+    changed = np.flatnonzero(old != new)
+    assert len(changed) == 4 and case.mask.ravel()[changed].all()
+    # exactly the single-precision sum that DHSVM computes (CheckOut.c:81-84)
+    total = np.float32(np.float32(np.float32(0.10) + np.float32(0.25)) + np.float32(0.40))
+    assert set(new[changed]) == {total}
+    assert "4 basin cells" in m.changes[0]
+    with pytest.raises(MutationError):
+        mutate_case(case, "shallow-soil", tmp_path / "x", {"cells": NROWS * NCOLS})
+
+
+def test_state_mutants_bring_their_own_state_directory(synthetic, short_tmp):
+    path, work = synthetic
+    case = DhsvmCase(path, work)
+    original = {s.label: s.path for s in state_files(case)}
+    for name, sets in (("truncate-state", 5), ("state-extra-layer", 12)):
+        out = short_tmp / name
+        new_input, _ = mutate_case(case, name, out)
+        mutant = DhsvmCase(new_input, work)
+        assert mutant.state_prefix == f"{out.resolve()}/state/"
+        files = {s.label: s.path for s in state_files(mutant)}
+        assert files["soil state"].stat().st_size == sets * NROWS * NCOLS * 4
+        for label in ("canopy interception state", "snow state"):  # the originals, linked
+            assert files[label].resolve() == original[label].resolve()
+        assert (out / "state" / f"Channel.State.{STAMP}").read_text()
+    # the extra data sets are copies of the last moisture and temperature layers
+    longer = np.fromfile(short_tmp / "state-extra-layer" / "state" / f"Soil.State.{STAMP}.bin",
+                         dtype="<f4").reshape(12, NROWS, NCOLS)
+    assert (longer[4] == longer[3]).all() and (longer[9] == longer[8]).all()
+    _, m = mutate_case(case, "truncate-state", short_tmp / "snow", {"state": "snow state"})
+    assert m.changes[0].startswith("snow state")
+    with pytest.raises(MutationError, match="choose from"):
+        mutate_case(case, "truncate-state", short_tmp / "x", {"state": "ice"})
+
+
+def test_a_state_directory_too_long_for_dhsvm_is_refused(synthetic, tmp_path):
+    path, work = synthetic
+    with pytest.raises(MutationError, match="has room for 85"):
+        mutate_case(DhsvmCase(path, work), "truncate-state", tmp_path / ("d" * 90))
+
+
+def test_output_directory_mutations(synthetic, tmp_path):
+    path, work = synthetic
+    case = DhsvmCase(path, work)
+    for name, value in (("missing-output-dir", "no-such-directory/"),
+                        ("output-no-slash", "output")):
+        new_input, _ = mutate_case(case, name, tmp_path / name)
+        assert DhsvmCase(new_input, work).output_prefix == value
+    no_slash = tmp_path / "output-no-slash" / "INPUT.output-no-slash"
+    with pytest.raises(MutationError, match="no '/'"):
+        mutate_case(DhsvmCase(no_slash, work), "output-no-slash", tmp_path / "again")
+    (work / "no-such-directory").mkdir()
+    with pytest.raises(MutationError, match="exists"):
+        mutate_case(case, "missing-output-dir", tmp_path / "taken")
